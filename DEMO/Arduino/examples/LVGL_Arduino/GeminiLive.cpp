@@ -103,12 +103,23 @@ static const char GTS_ROOTS_PEM[] =
 "p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD\n"
 "-----END CERTIFICATE-----\n";
 
+// Recursive so handleEvent (already holding the lock via loop()) can call
+// sendSetup() without deadlocking.
+namespace {
+struct WsLock {
+  SemaphoreHandle_t h;
+  explicit WsLock(SemaphoreHandle_t m) : h(m) { if (h) xSemaphoreTakeRecursive(h, portMAX_DELAY); }
+  ~WsLock() { if (h) xSemaphoreGiveRecursive(h); }
+};
+}
+
 static const char* GEMINI_HOST = "generativelanguage.googleapis.com";
 static const uint16_t GEMINI_PORT = 443;
 
 GeminiLiveClient geminiLive;
 
 void GeminiLiveClient::begin() {
+  if (!_wsMutex) _wsMutex = xSemaphoreCreateRecursiveMutex();
   Serial.printf("[GeminiLive] heap before connect: free=%u largest_internal_block=%u free_internal=%u free_spiram=%u\n",
     ESP.getFreeHeap(),
     heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
@@ -117,6 +128,7 @@ void GeminiLiveClient::begin() {
 
   String url = String("/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=") + GEMINI_API_KEY;
 
+  WsLock lock(_wsMutex);
   _ws.onEvent([this](WStype_t type, uint8_t* payload, size_t length) {
     this->handleEvent(type, payload, length);
   });
@@ -125,6 +137,7 @@ void GeminiLiveClient::begin() {
 }
 
 void GeminiLiveClient::reconnect() {
+  WsLock lock(_wsMutex);
   // The old socket belongs to the previous network; drop it before redialing.
   // _sessionHandle is deliberately kept, so the conversation resumes rather
   // than restarting just because the WiFi network changed.
@@ -135,6 +148,7 @@ void GeminiLiveClient::reconnect() {
 }
 
 void GeminiLiveClient::loop() {
+  WsLock lock(_wsMutex);
   _ws.loop();
 }
 
@@ -170,6 +184,7 @@ void GeminiLiveClient::sendSetup() {
   }
   msg += "}}}";
   Serial.printf("[GeminiLive] sending setup (resuming: %s)\n", _sessionHandle.length() > 0 ? "yes" : "no");
+  WsLock lock(_wsMutex); // recursive: already held when called from handleEvent
   _ws.sendTXT(msg);
 }
 
@@ -197,25 +212,38 @@ void GeminiLiveClient::sendAudioChunk(const uint8_t* pcm16, size_t len) {
   msg += "{\"realtimeInput\":{\"audio\":{\"data\":\"";
   msg.concat((const char*)b64buf, outLen);
   msg += "\",\"mimeType\":\"audio/pcm;rate=16000\"}}}";
-  _ws.sendTXT(msg);
+  {
+    WsLock lock(_wsMutex);
+    if (!_wsConnected) return;
+    _ws.sendTXT(msg);
+  }
 }
 
 void GeminiLiveClient::sendAudioStreamEnd() {
+  WsLock lock(_wsMutex);
   if (!_wsConnected) return;
+  // Logged with a timestamp so a close frame arriving straight afterwards can
+  // be attributed to this message rather than guessed at.
+  Serial.printf("[GeminiLive] TX audioStreamEnd (t=%lu, ready=%d)\n", millis(), (int)_ready);
   _ws.sendTXT("{\"realtimeInput\":{\"audioStreamEnd\":true}}");
 }
 
 void GeminiLiveClient::handleEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
-      Serial.println("[GeminiLive] WSS connected");
+      _sessionStartMs = millis();
+      Serial.printf("[GeminiLive] WSS connected (t=%lu)\n", millis());
       _wsConnected = true;
       _ready = false;
       _fragBuf = "";
       sendSetup();
       break;
     case WStype_DISCONNECTED: {
-      Serial.println("[GeminiLive] WSS disconnected");
+      // Session age matters: a credential that expires mid-session would show
+      // up as drops clustering around a consistent lifetime.
+      Serial.printf("[GeminiLive] WSS disconnected (t=%lu, session_age=%lus, close=%u '%s')\n",
+                    millis(), (millis() - _sessionStartMs) / 1000,
+                    ws_last_close_code, ws_last_close_reason);
       // Was a turn in flight? Then this drop cost the user an answer, and they
       // need to be told - silence alone reads as "the device is broken".
       bool lostMidSession = _ready;

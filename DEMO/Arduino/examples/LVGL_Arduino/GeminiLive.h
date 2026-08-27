@@ -2,6 +2,8 @@
 #include <Arduino.h>
 #include <functional>
 #include <WebSocketsClient.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 class GeminiLiveClient {
 public:
@@ -37,10 +39,19 @@ private:
   void handleServerText(const char* json, size_t len);
   void sendSetup();
 
+  // WebSocketsClient is NOT thread-safe, and three tasks reach it: GeminiLoopTask
+  // (loop(), which tears down the TLS client on disconnect), GVCapture
+  // (sendAudioChunk) and the LVGL task (sendAudioStreamEnd, via a cancel tap).
+  // Tapping mid-turn while the socket was dropping freed the TLS object under
+  // another task and crashed with InstrFetchProhibited at PC=0. Every entry
+  // point below takes this lock.
+  SemaphoreHandle_t _wsMutex = nullptr;
+
   WebSocketsClient _ws;
   bool _wsConnected = false;
   bool _ready = false; // setupComplete received
   bool _quotaExhausted = false;
+  unsigned long _sessionStartMs = 0;
 
   String _fragBuf; // accumulates fragmented TEXT frames, if any arrive
   String _sessionHandle; // resumption token from the last sessionResumptionUpdate, if any
