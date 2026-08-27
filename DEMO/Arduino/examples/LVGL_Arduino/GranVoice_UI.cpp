@@ -26,6 +26,7 @@ static volatile GVState state = GVState::IDLE;
 static volatile bool turnCompleteFlag = false;
 static volatile bool interruptedFlag = false;
 static volatile bool audioArrivedFlag = false;
+static volatile bool sessionLostFlag = false;
 static unsigned long listenStartMs = 0;
 
 // Reply/heard text is produced on the WS task but may only be rendered on the
@@ -184,6 +185,7 @@ static void OnButtonClicked(lv_event_t* e) {
     }
     Serial.println("[GranVoice] -> LISTENING");
     lv_label_set_text(replyLabel, "");
+    lv_obj_set_style_text_color(replyLabel, lv_color_white(), 0); // clear any error styling
     listenStartMs = millis();
     state = GVState::LISTENING;
     GranVoice_Audio_StartCapture();
@@ -230,6 +232,28 @@ static void GranVoice_Tick(lv_timer_t*) {
     // Keep the newest words visible as the reply streams in; the user can still
     // swipe back up through the container to re-read earlier text.
     lv_obj_scroll_to_y(replyBox, LV_COORD_MAX, LV_ANIM_OFF);
+  }
+
+  // Server dropped the session mid-turn. Say so plainly and point at the fix,
+  // instead of dropping to idle in silence as if nothing had been asked.
+  if (sessionLostFlag) {
+    sessionLostFlag = false;
+    if (state != GVState::IDLE) {
+      GranVoice_Audio_StopCapture();
+      GranVoice_Audio_FlushPlayback();
+      turnCompleteFlag = false;
+      state = GVState::IDLE;
+      SetVisual(GVState::IDLE);
+    }
+    portENTER_CRITICAL(&replyMux);
+    pendingReply[0] = '\0';
+    replyDirty = false;
+    portEXIT_CRITICAL(&replyMux);
+    lv_label_set_text(replyLabel,
+      "Зв'язок перервано.\nНатисніть і спитайте ще раз.");
+    lv_obj_set_style_text_color(replyLabel, lv_palette_main(LV_PALETTE_ORANGE), 0);
+    Serial.println("[GranVoice] session lost mid-turn - told the user to retry");
+    return;
   }
 
   if (interruptedFlag) {
@@ -632,6 +656,7 @@ void GranVoice_UI_Init(void) {
   });
   geminiLive.onTurnComplete([]() { turnCompleteFlag = true; });
   geminiLive.onInterrupted([]() { interruptedFlag = true; });
+  geminiLive.onSessionLost([]() { sessionLostFlag = true; });
 
   // Gemini streams the reply transcript in fragments; append them so the label
   // shows the whole sentence rather than the last few words.

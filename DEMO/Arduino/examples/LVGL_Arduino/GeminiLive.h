@@ -23,6 +23,11 @@ public:
   void onHeard(TextCallback cb) { _onHeard = cb; }   // transcript of the user's speech
   void onSaying(TextCallback cb) { _onSaying = cb; } // transcript of Gemini's reply
 
+  // Fired when the server drops the session unexpectedly (i.e. not because we
+  // asked). Without this the UI just fell silent mid-answer, leaving no clue
+  // that anything went wrong or that retrying would help.
+  void onSessionLost(SimpleCallback cb) { _onSessionLost = cb; }
+
   // True once the server has refused a session with a quota error. Nothing will
   // work until the quota window resets, so the UI says so rather than looking broken.
   bool isQuotaExhausted() const { return _quotaExhausted; }
@@ -45,6 +50,7 @@ private:
   SimpleCallback _onInterrupted;
   TextCallback _onHeard;
   TextCallback _onSaying;
+  SimpleCallback _onSessionLost;
 };
 
 extern GeminiLiveClient geminiLive;

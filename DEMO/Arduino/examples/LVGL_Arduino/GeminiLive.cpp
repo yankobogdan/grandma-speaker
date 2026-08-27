@@ -214,10 +214,14 @@ void GeminiLiveClient::handleEvent(WStype_t type, uint8_t* payload, size_t lengt
       _fragBuf = "";
       sendSetup();
       break;
-    case WStype_DISCONNECTED:
+    case WStype_DISCONNECTED: {
       Serial.println("[GeminiLive] WSS disconnected");
+      // Was a turn in flight? Then this drop cost the user an answer, and they
+      // need to be told - silence alone reads as "the device is broken".
+      bool lostMidSession = _ready;
       _wsConnected = false;
       _ready = false;
+      if (lostMidSession && _onSessionLost) _onSessionLost();
       // A quota refusal won't clear by retrying hard - hammering it every 3s
       // just adds load and risks deeper throttling. Back right off and let the
       // UI tell the user, rather than looking silently broken.
@@ -229,6 +233,7 @@ void GeminiLiveClient::handleEvent(WStype_t type, uint8_t* payload, size_t lengt
         _ws.setReconnectInterval(300000); // 5 min
       }
       break;
+    }
     case WStype_TEXT:
     case WStype_BIN: // the Live API sends its JSON frames with a binary opcode
       Serial.printf("[GeminiLive] RX frame: %u bytes\n", (unsigned)length);
