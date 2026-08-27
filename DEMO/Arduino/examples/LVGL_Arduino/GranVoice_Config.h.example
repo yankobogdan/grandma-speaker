@@ -1,0 +1,31 @@
+// GranVoice_Config.h.example - Template configuration file
+// Copy this to GranVoice_Config.h and fill in your real API key.
+// GranVoice_Config.h is gitignored - never commit your key.
+
+#pragma once
+
+// Get a key at https://aistudio.google.com/apikey
+#define GEMINI_API_KEY "your_gemini_api_key_here"
+
+// Live API model. Availability rotates - check your Google AI Studio
+// console if this model id stops working and swap it here.
+#define GEMINI_MODEL "models/gemini-3.1-flash-live-preview"
+
+// Prebuilt voice name for generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName
+#define GEMINI_VOICE_NAME "Kore"
+
+// Native-audio models pick the reply language from the input language,
+// so "always answer in Ukrainian" has to be stated in the persona itself.
+#define GRANVOICE_SYSTEM_PROMPT \
+  "Ти - теплий, турботливий голосовий співрозмовник для літньої людини. " \
+  "Говори ЗАВЖДИ українською мовою, простими короткими реченнями, чітко і не поспішаючи. " \
+  "Будь терплячою, доброзичливою і уважною. Підтримуй розмову на будь-яку тему: " \
+  "погода, здоров'я, спогади, новини, рецепти, анекдоти. " \
+  "Якщо співрозмовниця просить повторити - повтори простіше і повільніше. " \
+  "Уникай складних термінів та англіцизмів. Відповідай короткими репліками, " \
+  "1-3 речення, щоб було легко слухати."
+
+// Fallback WiFi tried at boot before the on-screen picker. Optional - leave the
+// SSID empty to rely purely on on-screen provisioning.
+#define GRANVOICE_DEFAULT_WIFI_SSID "YourNetworkName"
+#define GRANVOICE_DEFAULT_WIFI_PASS "your_wifi_password"

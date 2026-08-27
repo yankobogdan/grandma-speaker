@@ -1,0 +1,20 @@
+# Large unmodified vendor libraries - install these separately, see README.
+# Excluded to keep the repo a few MB instead of ~666MB. They remain on disk
+# locally; only publication skips them.
+DEMO/Arduino/libraries/lvgl/
+DEMO/Arduino/libraries/ESP32-audioI2S-master/
+
+# Redundant duplicate of the libraries tree, nested inside the sketch folder.
+DEMO/Arduino/examples/LVGL_Arduino/libraries/
+
+# Vendor ESP-IDF demo project - not used by this firmware. Kept locally as a
+# hardware reference (its MIC_Driver documents the V1 mic wiring).
+DEMO/ESP-IDF/
+
+# Build artifacts
+build/
+*.bin
+*.elf
+*.map
+
+.DS_Store

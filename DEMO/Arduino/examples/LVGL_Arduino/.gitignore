@@ -1,0 +1,15 @@
+# WiFi credentials - keep this private!
+password.json
+WiFi_Config.h
+
+# Gemini API key - keep this private!
+GranVoice_Config.h
+
+# Build artifacts
+*.bin
+*.elf
+*.map
+
+# Arduino build folders
+build/
+.build/
