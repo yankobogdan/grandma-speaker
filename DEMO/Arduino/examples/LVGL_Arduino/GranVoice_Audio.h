@@ -16,3 +16,10 @@ void GranVoice_Audio_SetSpeechEnabled(bool enabled);
 bool GranVoice_Audio_GetSpeechEnabled();
 
 void GranVoice_Audio_PlayTap(); // short click, UI tap feedback
+
+// Reply lifecycle. Without this the playback task had to infer the end of a
+// reply from an empty buffer, which is indistinguishable from a network gap:
+// it would tear down and re-buffer mid-answer, producing short bursts of audio
+// separated by silence.
+void GranVoice_Audio_ReplyBegin();
+void GranVoice_Audio_ReplyEnd();

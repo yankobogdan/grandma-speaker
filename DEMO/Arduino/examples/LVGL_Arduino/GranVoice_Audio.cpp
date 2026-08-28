@@ -42,7 +42,11 @@ static SemaphoreHandle_t i2sTxMutex = nullptr;
 // underruns.
 #define RESAMPLE_STEP_Q16 ((uint32_t)(0x18000))
 
-static volatile bool playbackActive = false; // false until pre-roll is satisfied
+static volatile bool playbackActive = false;  // false until pre-roll is satisfied
+static volatile bool replyStreaming = false;  // true from first audio until turnComplete
+
+void GranVoice_Audio_ReplyBegin() { replyStreaming = true; }
+void GranVoice_Audio_ReplyEnd()   { replyStreaming = false; }
 
 static void PlaybackTask(void*) {
   static const size_t IN_BUF_SAMPLES = 4096;
@@ -79,17 +83,19 @@ static void PlaybackTask(void*) {
         lastAvail = avail;
         lastGrowthMs = millis();
       }
-      // Start once we have a cushion, or when the stream has clearly stopped
-      // growing (a short reply that will never reach the pre-roll size).
+      // Start once the cushion is built, or immediately if the reply has
+      // already finished (a short answer that will never reach PREROLL_BYTES).
+      // The old "stopped growing for 250ms" guess fired on ordinary network
+      // gaps and started playback with almost nothing buffered.
       bool cushioned = avail >= (size_t)PREROLL_BYTES;
-      bool stalled   = (millis() - lastGrowthMs) > 250;
-      if (!cushioned && !stalled) {
+      bool replyOver = !replyStreaming;
+      if (!cushioned && !replyOver) {
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }
       playbackActive = true;
       Serial.printf("[Playback] start (buffered %u B, %s)\n",
-                    (unsigned)avail, cushioned ? "pre-roll" : "stalled");
+                    (unsigned)avail, cushioned ? "cushion" : "reply-complete");
     }
 
     // --- greedy fill ---------------------------------------------------------
@@ -108,7 +114,18 @@ static void PlaybackTask(void*) {
     }
 
     if (got == 0) {
-      // Nothing left: the reply has finished, so re-arm the pre-roll for next time.
+      if (replyStreaming) {
+        // Underrun mid-answer: more audio is still coming, so hold the playback
+        // state and wait rather than re-running the pre-roll, which is what
+        // chopped answers into bursts separated by silence.
+        static unsigned long lastStarveLog = 0;
+        if (millis() - lastStarveLog > 1000) {
+          lastStarveLog = millis();
+          Serial.println("[Playback] starved mid-reply - waiting for more audio");
+        }
+        continue;
+      }
+      // Reply finished and everything drained: re-arm for the next one.
       playbackActive = false;
       haveCarry = false;
       srcPosQ16 = 0;

@@ -335,6 +335,7 @@ static void SetScreenLocked(bool locked) {
 
 static void CancelToIdle(const char* reason) {
   Serial.printf("[GranVoice] -> IDLE (%s)\n", reason);
+  GranVoice_Audio_ReplyEnd();
   if (state == GVState::LISTENING) UsageAddMs(millis() - listenStartMs);
   GranVoice_Audio_StopCapture();
   geminiLive.sendAudioStreamEnd();
@@ -473,6 +474,7 @@ static void GranVoice_Tick(lv_timer_t*) {
   if (sessionLostFlag) {
     sessionLostFlag = false;
     if (state != GVState::IDLE) {
+      GranVoice_Audio_ReplyEnd();
       GranVoice_Audio_StopCapture();
       GranVoice_Audio_FlushPlayback();
       turnCompleteFlag = false;
@@ -965,6 +967,7 @@ void GranVoice_UI_Init(void) {
   ShowMain();
 
   geminiLive.onAudio([](const uint8_t* pcm, size_t len) {
+    GranVoice_Audio_ReplyBegin(); // audio still arriving: gaps are not the end
     if (state == GVState::LISTENING) {
       UsageAddMs(millis() - listenStartMs); // mic stops here, so bank the time
       GranVoice_Audio_StopCapture();
@@ -973,7 +976,7 @@ void GranVoice_UI_Init(void) {
     }
     GranVoice_Audio_QueuePlayback(pcm, len);
   });
-  geminiLive.onTurnComplete([]() { turnCompleteFlag = true; });
+  geminiLive.onTurnComplete([]() { GranVoice_Audio_ReplyEnd(); turnCompleteFlag = true; });
   geminiLive.onInterrupted([]() { interruptedFlag = true; });
   geminiLive.onSessionLost([]() { sessionLostFlag = true; });
 
