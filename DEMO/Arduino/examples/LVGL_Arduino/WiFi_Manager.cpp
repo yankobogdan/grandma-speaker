@@ -226,17 +226,30 @@ bool WiFiManager::connectToBestNetwork() {
 
 bool WiFiManager::retryKnownNetworks() {
     WiFi.mode(WIFI_STA);
-    WiFi.scanDelete();
-    int n = WiFi.scanNetworks();
-    if (n <= 0) return false;
 
+    // Try saved networks directly first, without scanning. A scan blocks the
+    // radio for a couple of seconds, and running one before every retry meant
+    // the radio spent nearly all its time scanning or associating, never
+    // settling - which made recovery slower, not faster.
+    int n = getSavedCount();
     for (int i = 0; i < n; i++) {
-        String ssid = WiFi.SSID(i);
-        if (ssid.length() == 0 || !isSaved(ssid)) continue;
+        String ssid = getSavedSSID(i);
+        if (ssid.length() == 0) continue;
+        Serial.printf("[WiFiRetry] trying '%s' directly\n", ssid.c_str());
         if (connectToNetwork(ssid.c_str(), getSavedPasswordFor(ssid).c_str())) {
             Serial.printf("[WiFiRetry] reconnected to %s\n", ssid.c_str());
             return true;
         }
+    }
+
+    // Only if none joined blind, scan to report what's actually around. This
+    // also tells us whether the network is simply out of range.
+    WiFi.scanDelete();
+    int found = WiFi.scanNetworks();
+    Serial.printf("[WiFiRetry] direct attempts failed; scan sees %d network(s)\n", found);
+    for (int i = 0; i < found && i < 12; i++) {
+        Serial.printf("[WiFiRetry]   %s (%d dBm)%s\n", WiFi.SSID(i).c_str(), WiFi.RSSI(i),
+                      isSaved(WiFi.SSID(i)) ? "  <- saved" : "");
     }
     return false;
 }

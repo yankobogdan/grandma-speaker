@@ -333,12 +333,39 @@ void GeminiLiveClient::handleEvent(WStype_t type, uint8_t* payload, size_t lengt
 }
 
 void GeminiLiveClient::handleServerText(const char* json, size_t len) {
-  // Internal RAM (not PSRAM) deliberately: this is the one buffer directly
-  // implicated in a connection-dropping stall earlier - JSON DOM parsing is a
-  // pointer-chasing, many-small-accesses workload, exactly what PSRAM's extra
-  // access latency hurts most. We have internal headroom (~220KB) to spare for
-  // it; everything else in this file (decode scratch, playback queue) is PSRAM.
-  DynamicJsonDocument doc(98304); // audio deltas can be up to ~64KB of base64 (WEBSOCKETS_MAX_DATA_SIZE)
+  // Audio frames take a fast path that never builds a JSON document. Parsing
+  // them properly meant allocating ~96KB and copying the ~50KB base64 payload
+  // for every delta, several times a second, on a task that outranks the UI -
+  // which starved the display and jittered playback. The payload shape is
+  // fixed, so the base64 is located by scanning and decoded straight out of
+  // the receive buffer.
+  const char* dataKey = strstr(json, "\"data\":\"");
+  if (dataKey) {
+    const char* b64 = dataKey + 8;
+    const char* b64End = strchr(b64, '"');
+    if (b64End && _onAudio) {
+      static const size_t PCM_BUF_CAP = 51200;
+      static uint8_t* pcmBuf = (uint8_t*) heap_caps_malloc(PCM_BUF_CAP, MALLOC_CAP_SPIRAM);
+      size_t outLen = 0;
+      if (pcmBuf && mbedtls_base64_decode(pcmBuf, PCM_BUF_CAP, &outLen,
+                                          (const unsigned char*)b64, b64End - b64) == 0) {
+        _onAudio(pcmBuf, outLen);
+      }
+    }
+    // Cheap string checks rather than a parse; these flags share the frame.
+    if (strstr(json, "\"turnComplete\": true") || strstr(json, "\"turnComplete\":true")) {
+      if (_onTurnComplete) _onTurnComplete();
+    }
+    if (strstr(json, "\"interrupted\": true") || strstr(json, "\"interrupted\":true")) {
+      if (_onInterrupted) _onInterrupted();
+    }
+    return;
+  }
+
+  // Everything else (setup, transcripts, session handles) is small, so a modest
+  // reusable document is enough - and reused, not reallocated per message.
+  static DynamicJsonDocument doc(16384);
+  doc.clear();
   DeserializationError err = deserializeJson(doc, json, len);
   if (err) {
     Serial.printf("[GeminiLive] JSON parse error: %s\n", err.c_str());
@@ -348,7 +375,7 @@ void GeminiLiveClient::handleServerText(const char* json, size_t len) {
   if (doc.containsKey("setupComplete")) {
     Serial.println("[GeminiLive] setup complete, ready");
     _ready = true;
-    if (_quotaExhausted) { // quota window recovered
+    if (_quotaExhausted) {
       _quotaExhausted = false;
       _ws.setReconnectInterval(3000);
       ws_last_close_reason[0] = '\0';
@@ -377,29 +404,6 @@ void GeminiLiveClient::handleServerText(const char* json, size_t len) {
   if (saying && saying[0]) {
     Serial.printf("[GeminiLive] saying: %s\n", saying);
     if (_onSaying) _onSaying(saying);
-  }
-
-  JsonObject modelTurn = serverContent["modelTurn"];
-  if (!modelTurn.isNull()) {
-    // PSRAM: base64 decode is a tight sequential scan (not pointer-chasing like
-    // JSON DOM parsing above), so PSRAM's latency isn't the same risk here -
-    // we have 8MB of it and use of internal RAM stays reserved for the doc.
-    static const size_t PCM_BUF_CAP = 51200; // decoded size of a ~64KB base64 payload
-    static uint8_t* pcmBuf = (uint8_t*) heap_caps_malloc(PCM_BUF_CAP, MALLOC_CAP_SPIRAM);
-    for (JsonObject part : modelTurn["parts"].as<JsonArray>()) {
-      JsonObject inlineData = part["inlineData"];
-      const char* b64 = inlineData["data"] | (const char*)nullptr;
-      if (b64 && _onAudio) {
-        size_t b64len = strlen(b64);
-        size_t outLen = 0;
-        int rc = mbedtls_base64_decode(pcmBuf, PCM_BUF_CAP, &outLen, (const unsigned char*)b64, b64len);
-        if (rc == 0) {
-          _onAudio(pcmBuf, outLen);
-        } else {
-          Serial.printf("[GeminiLive] base64 decode error: %d\n", rc);
-        }
-      }
-    }
   }
 
   if (serverContent["interrupted"] | false) {
