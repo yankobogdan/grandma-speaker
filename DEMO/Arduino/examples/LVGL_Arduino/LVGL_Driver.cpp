@@ -23,9 +23,22 @@ void Lvgl_Display_LCD( lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_
   lv_disp_flush_ready( disp_drv );
 }
 /*Read the touchpad*/
+// Set while the screen is locked (long-press on BOOT). Checked here rather than
+// in individual widgets so the whole UI is inert, not just the talk button.
+extern bool granvoice_touch_locked;
+
 void Lvgl_Touchpad_Read( lv_indev_drv_t * indev_drv, lv_indev_data_t * data )
 {
   Touch_Read_Data();
+  if (granvoice_touch_locked) {
+    // Drain the controller so a touch made while locked isn't replayed on unlock.
+    touch_data.x = 0;
+    touch_data.y = 0;
+    touch_data.points = 0;
+    touch_data.gesture = NONE;
+    data->state = LV_INDEV_STATE_REL;
+    return;
+  }
   if (touch_data.points != 0x00) {
     data->point.x = touch_data.x;
     data->point.y = touch_data.y;

@@ -18,7 +18,9 @@
 // but don't attach a serial adapter to the UART header while using it.
 #define TALK_BUTTON_PIN 44
 
-static bool screenLocked = false;
+// Read by the LVGL touch driver: while set, touch input is swallowed before
+// LVGL ever sees it. Gating only the talk button left the rest of the UI live.
+bool granvoice_touch_locked = false;
 
 extern WiFiManager wifiManager;
 
@@ -42,7 +44,9 @@ static unsigned long listenStartMs = 0;
 // Reply/heard text is produced on the WS task but may only be rendered on the
 // LVGL task, so it lands in these buffers and GranVoice_Tick paints them.
 static char pendingReply[512] = {0};
+static char pendingHeard[256] = {0};   // transcript of what the user said
 static volatile bool replyDirty = false;
+static volatile bool heardDirty = false;
 static portMUX_TYPE replyMux = portMUX_INITIALIZER_UNLOCKED;
 
 static lv_obj_t* mainScreen = nullptr;
@@ -50,6 +54,7 @@ static lv_obj_t* talkBtn = nullptr;
 static lv_obj_t* talkLabel = nullptr;
 static lv_obj_t* replyBox = nullptr;   // scrollable container for long replies
 static lv_obj_t* replyLabel = nullptr;
+static lv_obj_t* heardLabel = nullptr; // what Gemini understood the user to say
 static lv_obj_t* wifiLabel = nullptr;
 static lv_obj_t* batteryLabel = nullptr;
 static lv_obj_t* usageLabel = nullptr;
@@ -253,29 +258,38 @@ static void UpdateWifiStatus() {
 }
 
 // Brief centred banner, used for lock state changes.
+static lv_obj_t* toastObj = nullptr;
+
+static void ToastExpire(lv_timer_t*) {
+  // Only the timer clears the toast, and it nulls the pointer as it goes.
+  // Deleting the timer here as well would double-free it: a repeat count of 1
+  // already makes LVGL dispose of it, and the stale pointer left behind by the
+  // previous version crashed the device on the next toast.
+  if (toastObj) {
+    lv_obj_del(toastObj);
+    toastObj = nullptr;
+  }
+}
+
 static void ShowToast(const char* text, lv_color_t colour) {
-  static lv_obj_t* toast = nullptr;
-  if (toast) { lv_obj_del(toast); toast = nullptr; }
-  toast = lv_label_create(lv_layer_top());
-  lv_obj_set_style_bg_color(toast, colour, 0);
-  lv_obj_set_style_bg_opa(toast, LV_OPA_COVER, 0);
-  lv_obj_set_style_text_color(toast, lv_color_white(), 0);
-  lv_obj_set_style_text_font(toast, &lv_font_ua_22, 0);
-  lv_obj_set_style_pad_all(toast, 14, 0);
-  lv_obj_set_style_radius(toast, 10, 0);
-  lv_label_set_text(toast, text);
-  lv_obj_center(toast);
-  // Self-deleting so callers don't have to track it.
-  lv_timer_t* t = lv_timer_create([](lv_timer_t* tm) {
-    lv_obj_t* o = (lv_obj_t*)tm->user_data;
-    if (o) lv_obj_del(o);
-    lv_timer_del(tm);
-  }, 1600, toast);
-  lv_timer_set_repeat_count(t, 1);
+  if (toastObj) { lv_obj_del(toastObj); toastObj = nullptr; }
+  toastObj = lv_label_create(lv_layer_top());
+  lv_obj_set_style_bg_color(toastObj, colour, 0);
+  lv_obj_set_style_bg_opa(toastObj, LV_OPA_COVER, 0);
+  lv_obj_set_style_text_color(toastObj, lv_color_white(), 0);
+  lv_obj_set_style_text_font(toastObj, &lv_font_ua_22, 0);
+  lv_obj_set_style_text_align(toastObj, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_pad_all(toastObj, 14, 0);
+  lv_obj_set_style_radius(toastObj, 10, 0);
+  lv_label_set_text(toastObj, text);
+  lv_obj_center(toastObj);
+
+  lv_timer_t* t = lv_timer_create(ToastExpire, 1600, nullptr);
+  lv_timer_set_repeat_count(t, 1); // LVGL frees the timer itself afterwards
 }
 
 static void SetScreenLocked(bool locked) {
-  screenLocked = locked;
+  granvoice_touch_locked = locked;
   if (locked) {
     ShowToast(LV_SYMBOL_CLOSE "  Екран заблоковано", lv_palette_darken(LV_PALETTE_BLUE_GREY, 2));
   } else {
@@ -299,7 +313,7 @@ static void CancelToIdle(const char* reason) {
 static void OnButtonClicked(lv_event_t* e) {
   // e == nullptr means a physical button, which stays live while the
   // touchscreen is locked - locking is about stray touches, not disabling the device.
-  if (screenLocked && e != nullptr) {
+  if (granvoice_touch_locked && e != nullptr) {
     Serial.println("[GranVoice] touch ignored - screen locked");
     ShowToast(LV_SYMBOL_CLOSE "  Екран заблоковано\nутримуйте BOOT", lv_palette_darken(LV_PALETTE_BLUE_GREY, 2));
     return;
@@ -315,8 +329,14 @@ static void OnButtonClicked(lv_event_t* e) {
     Serial.println("[GranVoice] -> LISTENING");
     lv_label_set_text(replyLabel, "");
     lv_obj_set_style_text_color(replyLabel, lv_color_white(), 0); // clear any error styling
+    lv_label_set_text(heardLabel, "");
+    portENTER_CRITICAL(&replyMux);
+    pendingHeard[0] = '\0';
+    pendingReply[0] = '\0';
+    portEXIT_CRITICAL(&replyMux);
     listenStartMs = millis();
     state = GVState::LISTENING;
+    geminiLive.beginTurn(); // re-arm audio sending after the previous streamEnd
     GranVoice_Audio_StartCapture();
     SetVisual(GVState::LISTENING);
   } else {
@@ -349,7 +369,7 @@ static void GranVoice_Tick(lv_timer_t*) {
       lockFiredThisHold = false;
     } else if (bootDown && !lockFiredThisHold && millis() - bootDownAt >= LOCK_HOLD_MS) {
       lockFiredThisHold = true; // fire once per hold, not repeatedly
-      SetScreenLocked(!screenLocked);
+      SetScreenLocked(!granvoice_touch_locked);
     }
     bootWasDown = bootDown;
   }
@@ -368,6 +388,15 @@ static void GranVoice_Tick(lv_timer_t*) {
         OnButtonClicked(nullptr);
       }
     }
+  }
+
+  if (heardDirty) {
+    portENTER_CRITICAL(&replyMux);
+    heardDirty = false;
+    static char hsnap[sizeof(pendingHeard) + 8];
+    snprintf(hsnap, sizeof(hsnap), "\u201c%s\u201d", pendingHeard);
+    portEXIT_CRITICAL(&replyMux);
+    lv_label_set_text(heardLabel, pendingHeard[0] ? hsnap : "");
   }
 
   if (replyDirty) {
@@ -467,6 +496,15 @@ static void BuildMainScreen() {
   lv_obj_set_style_text_font(talkLabel, &lv_font_ua_22, 0);
   lv_obj_center(talkLabel);
 
+  // What the user said, in muted italic-ish grey above the answer, so it's
+  // clear what Gemini actually understood.
+  heardLabel = lv_label_create(mainScreen);
+  lv_obj_set_style_text_font(heardLabel, &lv_font_ua_22, 0);
+  lv_obj_set_style_text_color(heardLabel, lv_palette_main(LV_PALETTE_BLUE_GREY), 0);
+  lv_obj_set_style_text_align(heardLabel, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_long_mode(heardLabel, LV_LABEL_LONG_DOT);
+  lv_label_set_text(heardLabel, "");
+
   // Reply transcript in a scrollable container, so a long answer can be swiped
   // through instead of overflowing off the round panel.
   replyBox = lv_obj_create(mainScreen);
@@ -506,17 +544,23 @@ static void ApplyMainLayout() {
 
   if (GetUseBootButton()) {
     lv_obj_set_size(talkBtn, 92, 92);
-    lv_obj_align(talkBtn, LV_ALIGN_TOP_MID, 0, 66);
+    lv_obj_align(talkBtn, LV_ALIGN_TOP_MID, 0, 62);
 
-    lv_obj_set_size(replyBox, 250, 150);
-    lv_obj_align(replyBox, LV_ALIGN_TOP_MID, 0, 168);
+    lv_obj_set_width(heardLabel, 250);
+    lv_obj_align(heardLabel, LV_ALIGN_TOP_MID, 0, 160);
+
+    lv_obj_set_size(replyBox, 250, 118);
+    lv_obj_align(replyBox, LV_ALIGN_TOP_MID, 0, 190);
     lv_obj_set_width(replyLabel, 236);
   } else {
-    lv_obj_set_size(talkBtn, 180, 180);
-    lv_obj_align(talkBtn, LV_ALIGN_CENTER, 0, -28);
+    lv_obj_set_size(talkBtn, 170, 170);
+    lv_obj_align(talkBtn, LV_ALIGN_CENTER, 0, -36);
 
-    lv_obj_set_size(replyBox, 250, 74);
-    lv_obj_align(replyBox, LV_ALIGN_BOTTOM_MID, 0, -52);
+    lv_obj_set_width(heardLabel, 240);
+    lv_obj_align(heardLabel, LV_ALIGN_BOTTOM_MID, 0, -104);
+
+    lv_obj_set_size(replyBox, 250, 64);
+    lv_obj_align(replyBox, LV_ALIGN_BOTTOM_MID, 0, -46);
     lv_obj_set_width(replyLabel, 236);
   }
 }
@@ -863,10 +907,18 @@ void GranVoice_UI_Init(void) {
     replyDirty = true;
     portEXIT_CRITICAL(&replyMux);
   });
-  geminiLive.onHeard([](const char*) {
+  // Gemini streams the input transcript in fragments, same as the reply, so
+  // they're appended rather than replacing each other.
+  geminiLive.onHeard([](const char* text) {
     portENTER_CRITICAL(&replyMux);
-    pendingReply[0] = '\0'; // new question - clear the previous answer
-    replyDirty = true;
+    if (pendingReply[0]) {      // previous answer still shown - new question starts
+      pendingReply[0] = '\0';
+      pendingHeard[0] = '\0';
+      replyDirty = true;
+    }
+    size_t used = strlen(pendingHeard);
+    strncat(pendingHeard, text, sizeof(pendingHeard) - used - 1);
+    heardDirty = true;
     portEXIT_CRITICAL(&replyMux);
   });
 

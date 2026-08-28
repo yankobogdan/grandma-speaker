@@ -214,14 +214,23 @@ void GeminiLiveClient::sendAudioChunk(const uint8_t* pcm16, size_t len) {
   msg += "\",\"mimeType\":\"audio/pcm;rate=16000\"}}}";
   {
     WsLock lock(_wsMutex);
-    if (!_wsConnected) return;
+    // Re-checked under the lock: `capturing` alone can go stale between the
+    // caller's check and here, letting a late chunk follow audioStreamEnd.
+    if (!_wsConnected || _streamEnded) return;
     _ws.sendTXT(msg);
   }
+}
+
+void GeminiLiveClient::beginTurn() {
+  WsLock lock(_wsMutex);
+  _streamEnded = false;
 }
 
 void GeminiLiveClient::sendAudioStreamEnd() {
   WsLock lock(_wsMutex);
   if (!_wsConnected) return;
+  if (_streamEnded) return; // already ended this turn
+  _streamEnded = true;
   // Logged with a timestamp so a close frame arriving straight afterwards can
   // be attributed to this message rather than guessed at.
   Serial.printf("[GeminiLive] TX audioStreamEnd (t=%lu, ready=%d)\n", millis(), (int)_ready);
@@ -235,6 +244,7 @@ void GeminiLiveClient::handleEvent(WStype_t type, uint8_t* payload, size_t lengt
       Serial.printf("[GeminiLive] WSS connected (t=%lu)\n", millis());
       _wsConnected = true;
       _ready = false;
+      _streamEnded = false;
       _fragBuf = "";
       sendSetup();
       break;

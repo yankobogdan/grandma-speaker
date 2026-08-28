@@ -16,6 +16,7 @@ public:
   void loop();           // pump frequently from a dedicated task
   bool isReady() const { return _ready; }
 
+  void beginTurn();                                      // re-arms audio sending
   void sendAudioChunk(const uint8_t* pcm16, size_t len); // 16kHz, 16-bit, mono
   void sendAudioStreamEnd();
 
@@ -51,6 +52,12 @@ private:
   bool _wsConnected = false;
   bool _ready = false; // setupComplete received
   bool _quotaExhausted = false;
+  // Set once audioStreamEnd has gone out, cleared by beginTurn(). Sending audio
+  // after the stream end is a protocol violation the server answers with
+  // close 1007 ("audio content type not supported for this model
+  // configuration"), which used to happen when a cancel tap raced a capture
+  // chunk already past its own `capturing` check.
+  bool _streamEnded = false;
   unsigned long _sessionStartMs = 0;
 
   String _fragBuf; // accumulates fragmented TEXT frames, if any arrive
