@@ -56,24 +56,12 @@ static lv_obj_t* heardLabel = nullptr; // live bubble for the current question
 static lv_obj_t* chatList = nullptr;   // scrollable conversation
 static lv_obj_t* replyBubble = nullptr; // live bubble for the current answer
 
-// Adds a bubble to the conversation and scrolls to it. Returns the label so a
-// streaming turn can keep updating the same bubble instead of adding one per
-// fragment.
-// Keeping every turn forever exhausted LVGL's heap and corrupted the display.
-// Older turns are dropped; the recent ones are what anyone scrolls back to.
-#define CHAT_MAX_BUBBLES 10
-
-static lv_obj_t* ChatAddBubble(bool fromUser, const char* text) {
-  if (!chatList) return nullptr;
-
-  while ((int)lv_obj_get_child_cnt(chatList) >= CHAT_MAX_BUBBLES) {
-    lv_obj_t* oldest = lv_obj_get_child(chatList, 0);
-    if (!oldest) break;
-    // Never free a bubble a live turn is still writing into.
-    if (oldest == lv_obj_get_parent(heardLabel ? heardLabel : nullptr) ||
-        oldest == lv_obj_get_parent(replyBubble ? replyBubble : nullptr)) break;
-    lv_obj_del(oldest);
-  }
+// Two pre-built bubbles, reused every turn. Creating a bubble per turn meant
+// LVGL object churn plus a flex relayout on every transcript fragment, and this
+// panel requires full_refresh, so each of those repainted all 360x360 pixels.
+// That combination made the UI unusable. Reusing fixed objects keeps the cost
+// of an update to "set one label's text".
+static lv_obj_t* MakeBubble(bool fromUser) {
   lv_obj_t* wrap = lv_obj_create(chatList);
   lv_obj_set_width(wrap, 280);
   lv_obj_set_height(wrap, LV_SIZE_CONTENT);
@@ -91,16 +79,28 @@ static lv_obj_t* ChatAddBubble(bool fromUser, const char* text) {
       fromUser ? lv_palette_lighten(LV_PALETTE_BLUE_GREY, 4) : lv_color_white(), 0);
   lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(lbl, 264);
-  lv_label_set_text(lbl, text);
-
-  lv_obj_scroll_to_view(wrap, LV_ANIM_OFF);
+  lv_label_set_text(lbl, "");
+  lv_obj_add_flag(wrap, LV_OBJ_FLAG_HIDDEN); // shown once it has text
   return lbl;
 }
 
 static void ChatClear() {
-  if (chatList) lv_obj_clean(chatList);
-  heardLabel = nullptr;
-  replyBubble = nullptr;
+  if (heardLabel) {
+    lv_label_set_text(heardLabel, "");
+    lv_obj_add_flag(lv_obj_get_parent(heardLabel), LV_OBJ_FLAG_HIDDEN);
+  }
+  if (replyBubble) {
+    lv_label_set_text(replyBubble, "");
+    lv_obj_add_flag(lv_obj_get_parent(replyBubble), LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+// Sets a bubble's text and reveals it on first use.
+static void BubbleSet(lv_obj_t* lbl, const char* text) {
+  if (!lbl) return;
+  lv_label_set_text(lbl, text);
+  lv_obj_t* wrap = lv_obj_get_parent(lbl);
+  if (text && text[0]) lv_obj_clear_flag(wrap, LV_OBJ_FLAG_HIDDEN);
 }
 static lv_obj_t* wifiLabel = nullptr;
 static lv_obj_t* batteryLabel = nullptr;
@@ -383,9 +383,8 @@ static void OnButtonClicked(lv_event_t* e) {
       return;
     }
     Serial.println("[GranVoice] -> LISTENING");
-    // Previous turn stays in the log; new bubbles are created for this one.
-    heardLabel = nullptr;
-    replyBubble = nullptr;
+    ChatClear();
+    if (replyBubble) lv_obj_set_style_text_color(replyBubble, lv_color_white(), 0);
     portENTER_CRITICAL(&replyMux);
     pendingHeard[0] = '\0';
     pendingReply[0] = '\0';
@@ -404,7 +403,7 @@ static void OnButtonClicked(lv_event_t* e) {
 // GeminiLive's callbacks (different task) only ever set the plain flags above.
 static void GranVoice_Tick(lv_timer_t*) {
   static unsigned long lastWifiCheck = 0;
-  if (millis() - lastWifiCheck > 2000) {
+  if (millis() - lastWifiCheck > 5000) {
     lastWifiCheck = millis();
     UpdateWifiStatus();
     UpdateBatteryStatus();
@@ -450,7 +449,10 @@ static void GranVoice_Tick(lv_timer_t*) {
   // costs a redraw + SPI transfer that competes with audio playback, so the
   // text is coalesced and applied at a steady, modest rate instead.
   static unsigned long lastTextPaint = 0;
-  bool mayPaintText = (millis() - lastTextPaint) >= 250;
+  // full_refresh is mandatory on this panel, so every text change repaints all
+  // 360x360 pixels. Coalescing hard keeps the SPI bus free for audio; twice a
+  // second still reads as live.
+  bool mayPaintText = (millis() - lastTextPaint) >= 500;
 
   if (heardDirty && mayPaintText) {
     lastTextPaint = millis();
@@ -462,8 +464,7 @@ static void GranVoice_Tick(lv_timer_t*) {
     portEXIT_CRITICAL(&replyMux);
     if (hsnap[0]) {
       // One bubble per question, updated as the transcript streams in.
-      if (!heardLabel) heardLabel = ChatAddBubble(true, hsnap);
-      else             lv_label_set_text(heardLabel, hsnap);
+      BubbleSet(heardLabel, hsnap);
     }
   }
 
@@ -476,9 +477,7 @@ static void GranVoice_Tick(lv_timer_t*) {
     snapshot[sizeof(snapshot) - 1] = '\0';
     portEXIT_CRITICAL(&replyMux);
     if (snapshot[0]) {
-      if (!replyBubble) replyBubble = ChatAddBubble(false, snapshot);
-      else              lv_label_set_text(replyBubble, snapshot);
-      lv_obj_scroll_to_y(chatList, LV_COORD_MAX, LV_ANIM_OFF);
+      BubbleSet(replyBubble, snapshot);
     }
   }
 
@@ -498,10 +497,8 @@ static void GranVoice_Tick(lv_timer_t*) {
     pendingReply[0] = '\0';
     replyDirty = false;
     portEXIT_CRITICAL(&replyMux);
-    replyBubble = nullptr;
-    heardLabel = nullptr;
-    lv_obj_t* errLbl = ChatAddBubble(false, "Зв'язок перервано. Натисніть і спитайте ще раз.");
-    if (errLbl) lv_obj_set_style_text_color(errLbl, lv_palette_main(LV_PALETTE_ORANGE), 0);
+    BubbleSet(replyBubble, "Зв'язок перервано. Натисніть і спитайте ще раз.");
+    if (replyBubble) lv_obj_set_style_text_color(replyBubble, lv_palette_main(LV_PALETTE_ORANGE), 0);
     Serial.println("[GranVoice] session lost mid-turn - told the user to retry");
     return;
   }
@@ -578,6 +575,9 @@ static void BuildMainScreen() {
   lv_obj_set_scroll_dir(chatList, LV_DIR_VER);
   lv_obj_set_scrollbar_mode(chatList, LV_SCROLLBAR_MODE_AUTO);
   lv_obj_set_flex_flow(chatList, LV_FLEX_FLOW_COLUMN);
+
+  heardLabel  = MakeBubble(true);   // question
+  replyBubble = MakeBubble(false);  // answer
 
   lv_obj_t* gear = lv_btn_create(mainScreen);
   lv_obj_set_size(gear, 44, 44);
