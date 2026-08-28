@@ -2,6 +2,7 @@
 #include "GranVoice_Config.h"
 #include <mbedtls/base64.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 
 // Google Trust Services root bundle (R1-R4, from https://pki.goog/repo/certs/).
 // generativelanguage.googleapis.com's edge nodes have been observed serving
@@ -159,7 +160,7 @@ void GeminiLiveClient::sendSetup() {
   msg += GEMINI_MODEL;
   msg += "\",\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],"
          "\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoiceConfig\":{\"voiceName\":\"";
-  msg += GEMINI_VOICE_NAME;
+  msg += getVoice();
   msg += "\"}}}},\"systemInstruction\":{\"parts\":[{\"text\":\"";
   msg += GRANVOICE_SYSTEM_PROMPT;
   // Ask for text transcripts of both sides alongside the audio - lets us verify
@@ -219,6 +220,38 @@ void GeminiLiveClient::sendAudioChunk(const uint8_t* pcm16, size_t len) {
     if (!_wsConnected || _streamEnded) return;
     _ws.sendTXT(msg);
   }
+}
+
+String GeminiLiveClient::getVoice() {
+  if (_voice.length() == 0) {
+    Preferences p;
+    p.begin("granvoice", true);
+    _voice = p.getString("voice", GEMINI_VOICE_NAME);
+    p.end();
+    if (_voice.length() == 0) _voice = GEMINI_VOICE_NAME;
+  }
+  return _voice;
+}
+
+void GeminiLiveClient::setVoice(const String& voiceName) {
+  _voice = voiceName;
+  Preferences p;
+  p.begin("granvoice", false);
+  p.putString("voice", voiceName);
+  p.end();
+  Serial.printf("[GeminiLive] voice -> %s (restarting session)\n", voiceName.c_str());
+  clearSession(); // the voice is only read at setup time
+}
+
+void GeminiLiveClient::clearSession() {
+  WsLock lock(_wsMutex);
+  _sessionHandle = ""; // without a handle the server starts a fresh conversation
+  Serial.println("[GeminiLive] conversation cleared - starting a new session");
+  _ws.disconnect();
+  _wsConnected = false;
+  _ready = false;
+  _streamEnded = false;
+  begin();
 }
 
 void GeminiLiveClient::beginTurn() {

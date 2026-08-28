@@ -29,20 +29,28 @@ static SemaphoreHandle_t i2sTxMutex = nullptr;
 // out of 8MB PSRAM, not the scarce ~220KB of internal RAM.
 #define PLAYBACK_STREAM_BYTES (192 * 1024)
 
+// Playback must start only once enough audio is buffered to ride out network
+// jitter. Gemini's deltas arrive unevenly, and starting on the first byte left
+// the DMA starved between packets - the "chunk by chunk" stutter.
+#define PREROLL_MS 350
+#define PREROLL_BYTES ((GEMINI_AUDIO_RATE * 2 * PREROLL_MS) / 1000)
+
+// 24000 -> 16000 is exactly 3:2, so the step is 1.5 in 16.16 fixed point.
+// Fixed point rather than double on purpose: the ESP32-S3 FPU is single
+// precision only, so double maths is software-emulated and doing several
+// operations per sample at 16kHz was itself burning enough CPU to cause
+// underruns.
+#define RESAMPLE_STEP_Q16 ((uint32_t)(0x18000))
+
+static volatile bool playbackActive = false; // false until pre-roll is satisfied
+
 static void PlaybackTask(void*) {
-  // int16 samples in (Gemini's 24kHz PCM) -> linearly resampled to 16kHz -> each
-  // sample widened to a left-justified int32 slot for the codec's 32-bit format.
-  //
-  // Larger chunks than before (85ms rather than 21ms per pass): fewer, bigger
-  // I2S writes leave far more slack before the TX DMA runs dry, which is what
-  // was truncating replies into noise.
-  static const size_t IN_BUF_SAMPLES = 2048;
-  static int16_t* inBuf = (int16_t*) heap_caps_malloc((IN_BUF_SAMPLES + 1) * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+  static const size_t IN_BUF_SAMPLES = 4096;
+  static int16_t* inBuf = (int16_t*) heap_caps_malloc((IN_BUF_SAMPLES + 2) * sizeof(int16_t), MALLOC_CAP_SPIRAM);
   static int32_t* outBuf = (int32_t*) heap_caps_malloc((IN_BUF_SAMPLES + 8) * sizeof(int32_t), MALLOC_CAP_SPIRAM);
-  static double srcPos = 0.0;
-  static int16_t carry = 0;      // last sample of the previous chunk
-  static bool haveCarry = false; // false until the first chunk has been seen
-  static const double RESAMPLE_STEP = (double)GEMINI_AUDIO_RATE / AUDIO_SAMPLE_RATE;
+  static uint32_t srcPosQ16 = 0;
+  static int16_t carry = 0;
+  static bool haveCarry = false;
 
   if (!inBuf || !outBuf) {
     Serial.println("[Playback] FATAL: buffer alloc failed");
@@ -50,53 +58,88 @@ static void PlaybackTask(void*) {
     return;
   }
 
+  unsigned long lastGrowthMs = 0;
+  size_t lastAvail = 0;
+
   for (;;) {
-    // inBuf[0] holds the carry sample so interpolation spans the chunk seam;
-    // without it every chunk boundary dropped a sample and clicked.
+    // --- pre-roll gate -------------------------------------------------------
+    if (!playbackActive) {
+      size_t avail = xStreamBufferBytesAvailable(playbackStream);
+      if (avail == 0) {
+        haveCarry = false;
+        srcPosQ16 = 0;
+        lastAvail = 0;
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+      if (avail > lastAvail) {          // still filling
+        lastAvail = avail;
+        lastGrowthMs = millis();
+      }
+      // Start once we have a cushion, or when the stream has clearly stopped
+      // growing (a short reply that will never reach the pre-roll size).
+      bool cushioned = avail >= (size_t)PREROLL_BYTES;
+      bool stalled   = (millis() - lastGrowthMs) > 250;
+      if (!cushioned && !stalled) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+      playbackActive = true;
+      Serial.printf("[Playback] start (buffered %u B, %s)\n",
+                    (unsigned)avail, cushioned ? "pre-roll" : "stalled");
+    }
+
+    // --- greedy fill ---------------------------------------------------------
+    // One blocking read, then top up without blocking, so each I2S write is as
+    // large as possible instead of a few milliseconds at a time.
+    size_t got = 0;
     size_t n = xStreamBufferReceive(playbackStream, (uint8_t*)(inBuf + 1),
-                                    IN_BUF_SAMPLES * sizeof(int16_t), pdMS_TO_TICKS(200));
-    if (n == 0) {
-      haveCarry = false; // idle gap - restart cleanly on the next reply
-      srcPos = 0.0;
+                                    IN_BUF_SAMPLES * sizeof(int16_t), pdMS_TO_TICKS(120));
+    got = n / sizeof(int16_t);
+    while (got < IN_BUF_SAMPLES) {
+      size_t more = xStreamBufferReceive(playbackStream,
+                                         (uint8_t*)(inBuf + 1 + got),
+                                         (IN_BUF_SAMPLES - got) * sizeof(int16_t), 0);
+      if (more == 0) break;
+      got += more / sizeof(int16_t);
+    }
+
+    if (got == 0) {
+      // Nothing left: the reply has finished, so re-arm the pre-roll for next time.
+      playbackActive = false;
+      haveCarry = false;
+      srcPosQ16 = 0;
+      lastAvail = 0;
       continue;
     }
-    size_t got = n / sizeof(int16_t);
 
-    size_t first, avail;
+    // --- resample 24k -> 16k, fixed point ------------------------------------
+    size_t avail;
     if (haveCarry) {
       inBuf[0] = carry;
-      first = 0;
       avail = got + 1;
     } else {
-      first = 1;
       avail = got + 1;
-      srcPos = 1.0; // skip the unused slot 0
+      srcPosQ16 = 1u << 16; // skip the unused slot 0
     }
 
     size_t outCount = 0;
-    while (true) {
-      size_t idx = (size_t)srcPos;
+    for (;;) {
+      uint32_t idx = srcPosQ16 >> 16;
       if (idx + 1 >= avail) break;
-      double frac = srcPos - (double)idx;
-      int16_t s0 = inBuf[idx];
-      int16_t s1 = inBuf[idx + 1];
-      outBuf[outCount++] = ((int32_t)(int16_t)(s0 + (int32_t)((s1 - s0) * frac))) << 16;
-      srcPos += RESAMPLE_STEP;
+      uint32_t frac = srcPosQ16 & 0xFFFF;
+      int32_t s0 = inBuf[idx];
+      int32_t s1 = inBuf[idx + 1];
+      int32_t v = s0 + (((s1 - s0) * (int32_t)frac) >> 16);
+      outBuf[outCount++] = v << 16;   // left-justify into the codec's 32-bit slot
+      srcPosQ16 += RESAMPLE_STEP_Q16;
     }
-    (void)first;
 
-    // Carry the final input sample and rebase srcPos relative to it, so the
-    // next chunk continues the waveform seamlessly.
     carry = inBuf[avail - 1];
     haveCarry = true;
-    srcPos -= (double)(avail - 1);
-    if (srcPos < 0) srcPos = 0;
+    srcPosQ16 -= (uint32_t)((avail - 1) << 16);
 
     if (outCount > 0) {
-      // TX-only lock (shared just with the tap click). It deliberately does NOT
-      // cover CaptureTask's read: RX and TX are independent DMA channels, and
-      // holding one lock across that blocking 100ms mic read was stalling
-      // playback long enough to underrun TX - the truncation-into-noise symptom.
       uint32_t t0 = millis();
       xSemaphoreTake(i2sTxMutex, portMAX_DELAY);
       size_t wrote = i2s.write((uint8_t*)outBuf, outCount * sizeof(int32_t));
@@ -106,9 +149,10 @@ static void PlaybackTask(void*) {
       static unsigned long lastPlayLog = 0;
       if (millis() - lastPlayLog > 1000) {
         lastPlayLog = millis();
-        Serial.printf("[Playback] out=%u samples, wrote=%u B in %ums, queued=%u B\n",
-                      (unsigned)outCount, (unsigned)wrote, (unsigned)dt,
-                      (unsigned)(PLAYBACK_STREAM_BYTES - xStreamBufferSpacesAvailable(playbackStream)));
+        Serial.printf("[Playback] out=%u samples (%ums audio), wrote=%u B in %ums, queued=%u B\n",
+                      (unsigned)outCount, (unsigned)(outCount * 1000 / AUDIO_SAMPLE_RATE),
+                      (unsigned)wrote, (unsigned)dt,
+                      (unsigned)xStreamBufferBytesAvailable(playbackStream));
       }
     }
   }
@@ -181,6 +225,10 @@ void GranVoice_Audio_QueuePlayback(const uint8_t* pcm24k, size_t len) {
 }
 
 bool GranVoice_Audio_IsPlaybackIdle() {
+  // Also false while a reply is mid-flight: with the pre-roll gate the stream
+  // buffer can drain momentarily while audio is still being played out, and
+  // treating that as "idle" ended the turn early.
+  if (playbackActive) return false;
   return playbackStream == nullptr || xStreamBufferIsEmpty(playbackStream);
 }
 
@@ -188,6 +236,7 @@ void GranVoice_Audio_FlushPlayback() {
   if (playbackStream) {
     xStreamBufferReset(playbackStream);
   }
+  playbackActive = false; // next reply re-buffers before starting
 }
 
 static int speechEnabled = -1; // -1 = not yet loaded from NVS

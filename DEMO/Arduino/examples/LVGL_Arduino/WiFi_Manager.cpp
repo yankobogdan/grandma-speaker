@@ -134,6 +134,11 @@ bool WiFiManager::connectToNetwork(const char* ssid, const char* password) {
     }
 
     WiFi.mode(WIFI_STA);
+    // Let the radio settle before associating. Connecting immediately after a
+    // scan fails often enough to matter (the vendor code had this delay; losing
+    // it during the multi-network rewrite made the first boot attempt fail at
+    // full signal, leaving the device offline until the 30s watchdog fired).
+    delay(400);
     WiFi.begin(ssid, password);
 
     Serial.printf("    Connecting to '%s'", ssid);
@@ -206,8 +211,12 @@ bool WiFiManager::connectToBestNetwork() {
         String ssid = WiFi.SSID(i);
         if (ssid.length() == 0 || !isSaved(ssid)) continue;
         Serial.printf("  saved network in range: %s (%d dBm)\n", ssid.c_str(), WiFi.RSSI(i));
-        if (connectToNetwork(ssid.c_str(), getSavedPasswordFor(ssid).c_str())) {
-            return true;
+        String pass = getSavedPasswordFor(ssid);
+        // Two attempts: the first association after a scan is unreliable even
+        // with a strong signal, and a retry almost always succeeds.
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (attempt) Serial.println("    retrying once");
+            if (connectToNetwork(ssid.c_str(), pass.c_str())) return true;
         }
     }
 

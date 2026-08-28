@@ -52,9 +52,43 @@ static portMUX_TYPE replyMux = portMUX_INITIALIZER_UNLOCKED;
 static lv_obj_t* mainScreen = nullptr;
 static lv_obj_t* talkBtn = nullptr;
 static lv_obj_t* talkLabel = nullptr;
-static lv_obj_t* replyBox = nullptr;   // scrollable container for long replies
-static lv_obj_t* replyLabel = nullptr;
-static lv_obj_t* heardLabel = nullptr; // what Gemini understood the user to say
+static lv_obj_t* heardLabel = nullptr; // live bubble for the current question
+static lv_obj_t* chatList = nullptr;   // scrollable conversation
+static lv_obj_t* replyBubble = nullptr; // live bubble for the current answer
+
+// Adds a bubble to the conversation and scrolls to it. Returns the label so a
+// streaming turn can keep updating the same bubble instead of adding one per
+// fragment.
+static lv_obj_t* ChatAddBubble(bool fromUser, const char* text) {
+  if (!chatList) return nullptr;
+  lv_obj_t* wrap = lv_obj_create(chatList);
+  lv_obj_set_width(wrap, 224);
+  lv_obj_set_height(wrap, LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_color(wrap,
+      fromUser ? lv_palette_darken(LV_PALETTE_BLUE_GREY, 3)
+               : lv_palette_darken(LV_PALETTE_TEAL, 4), 0);
+  lv_obj_set_style_border_width(wrap, 0, 0);
+  lv_obj_set_style_radius(wrap, 10, 0);
+  lv_obj_set_style_pad_all(wrap, 8, 0);
+  lv_obj_clear_flag(wrap, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t* lbl = lv_label_create(wrap);
+  lv_obj_set_style_text_font(lbl, &lv_font_ua_22, 0);
+  lv_obj_set_style_text_color(lbl,
+      fromUser ? lv_palette_lighten(LV_PALETTE_BLUE_GREY, 4) : lv_color_white(), 0);
+  lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(lbl, 208);
+  lv_label_set_text(lbl, text);
+
+  lv_obj_scroll_to_view(wrap, LV_ANIM_OFF);
+  return lbl;
+}
+
+static void ChatClear() {
+  if (chatList) lv_obj_clean(chatList);
+  heardLabel = nullptr;
+  replyBubble = nullptr;
+}
 static lv_obj_t* wifiLabel = nullptr;
 static lv_obj_t* batteryLabel = nullptr;
 static lv_obj_t* usageLabel = nullptr;
@@ -322,14 +356,22 @@ static void OnButtonClicked(lv_event_t* e) {
   GranVoice_Audio_PlayTap();
   if (state == GVState::IDLE) {
     if (!geminiLive.isReady()) {
+      // Say *why* it isn't ready: "please wait" alone gave no clue whether the
+      // problem was the network, the quota, or just a slow connect.
       Serial.println("[GranVoice] tap ignored, Gemini not ready yet");
-      lv_label_set_text(talkLabel, "Зачекайте...");
+      if (WiFi.status() != WL_CONNECTED) {
+        ShowToast(LV_SYMBOL_WARNING "  Немає WiFi\nПідключення...", lv_palette_main(LV_PALETTE_ORANGE));
+      } else if (geminiLive.isQuotaExhausted()) {
+        ShowToast(LV_SYMBOL_WARNING "  Ліміт Gemini\nвичерпано", lv_palette_main(LV_PALETTE_RED));
+      } else {
+        ShowToast(LV_SYMBOL_REFRESH "  Підключення до Gemini...", lv_palette_darken(LV_PALETTE_BLUE_GREY, 2));
+      }
       return;
     }
     Serial.println("[GranVoice] -> LISTENING");
-    lv_label_set_text(replyLabel, "");
-    lv_obj_set_style_text_color(replyLabel, lv_color_white(), 0); // clear any error styling
-    lv_label_set_text(heardLabel, "");
+    // Previous turn stays in the log; new bubbles are created for this one.
+    heardLabel = nullptr;
+    replyBubble = nullptr;
     portENTER_CRITICAL(&replyMux);
     pendingHeard[0] = '\0';
     pendingReply[0] = '\0';
@@ -393,10 +435,15 @@ static void GranVoice_Tick(lv_timer_t*) {
   if (heardDirty) {
     portENTER_CRITICAL(&replyMux);
     heardDirty = false;
-    static char hsnap[sizeof(pendingHeard) + 8];
-    snprintf(hsnap, sizeof(hsnap), "\u201c%s\u201d", pendingHeard);
+    static char hsnap[sizeof(pendingHeard)];
+    strncpy(hsnap, pendingHeard, sizeof(hsnap));
+    hsnap[sizeof(hsnap) - 1] = '\0';
     portEXIT_CRITICAL(&replyMux);
-    lv_label_set_text(heardLabel, pendingHeard[0] ? hsnap : "");
+    if (hsnap[0]) {
+      // One bubble per question, updated as the transcript streams in.
+      if (!heardLabel) heardLabel = ChatAddBubble(true, hsnap);
+      else             lv_label_set_text(heardLabel, hsnap);
+    }
   }
 
   if (replyDirty) {
@@ -406,10 +453,11 @@ static void GranVoice_Tick(lv_timer_t*) {
     strncpy(snapshot, pendingReply, sizeof(snapshot));
     snapshot[sizeof(snapshot) - 1] = '\0';
     portEXIT_CRITICAL(&replyMux);
-    lv_label_set_text(replyLabel, snapshot);
-    // Keep the newest words visible as the reply streams in; the user can still
-    // swipe back up through the container to re-read earlier text.
-    lv_obj_scroll_to_y(replyBox, LV_COORD_MAX, LV_ANIM_OFF);
+    if (snapshot[0]) {
+      if (!replyBubble) replyBubble = ChatAddBubble(false, snapshot);
+      else              lv_label_set_text(replyBubble, snapshot);
+      lv_obj_scroll_to_y(chatList, LV_COORD_MAX, LV_ANIM_OFF);
+    }
   }
 
   // Server dropped the session mid-turn. Say so plainly and point at the fix,
@@ -427,9 +475,10 @@ static void GranVoice_Tick(lv_timer_t*) {
     pendingReply[0] = '\0';
     replyDirty = false;
     portEXIT_CRITICAL(&replyMux);
-    lv_label_set_text(replyLabel,
-      "Зв'язок перервано.\nНатисніть і спитайте ще раз.");
-    lv_obj_set_style_text_color(replyLabel, lv_palette_main(LV_PALETTE_ORANGE), 0);
+    replyBubble = nullptr;
+    heardLabel = nullptr;
+    lv_obj_t* errLbl = ChatAddBubble(false, "Зв'язок перервано. Натисніть і спитайте ще раз.");
+    if (errLbl) lv_obj_set_style_text_color(errLbl, lv_palette_main(LV_PALETTE_ORANGE), 0);
     Serial.println("[GranVoice] session lost mid-turn - told the user to retry");
     return;
   }
@@ -496,31 +545,16 @@ static void BuildMainScreen() {
   lv_obj_set_style_text_font(talkLabel, &lv_font_ua_22, 0);
   lv_obj_center(talkLabel);
 
-  // What the user said, in muted italic-ish grey above the answer, so it's
-  // clear what Gemini actually understood.
-  heardLabel = lv_label_create(mainScreen);
-  lv_obj_set_style_text_font(heardLabel, &lv_font_ua_22, 0);
-  lv_obj_set_style_text_color(heardLabel, lv_palette_main(LV_PALETTE_BLUE_GREY), 0);
-  lv_obj_set_style_text_align(heardLabel, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_long_mode(heardLabel, LV_LABEL_LONG_DOT);
-  lv_label_set_text(heardLabel, "");
-
-  // Reply transcript in a scrollable container, so a long answer can be swiped
-  // through instead of overflowing off the round panel.
-  replyBox = lv_obj_create(mainScreen);
-  lv_obj_set_style_bg_opa(replyBox, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(replyBox, 0, 0);
-  lv_obj_set_style_pad_all(replyBox, 0, 0);
-  lv_obj_set_scroll_dir(replyBox, LV_DIR_VER);
-  lv_obj_set_scrollbar_mode(replyBox, LV_SCROLLBAR_MODE_AUTO);
-
-  replyLabel = lv_label_create(replyBox);
-  lv_obj_set_style_text_font(replyLabel, &lv_font_ua_22, 0);
-  lv_obj_set_style_text_color(replyLabel, lv_color_white(), 0);
-  lv_obj_set_style_text_align(replyLabel, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_long_mode(replyLabel, LV_LABEL_LONG_WRAP);
-  lv_obj_align(replyLabel, LV_ALIGN_TOP_MID, 0, 0);
-  lv_label_set_text(replyLabel, "");
+  // Scrollable conversation: question and answer bubbles accumulate so earlier
+  // turns can be read back, instead of each reply replacing the last.
+  chatList = lv_obj_create(mainScreen);
+  lv_obj_set_style_bg_opa(chatList, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(chatList, 0, 0);
+  lv_obj_set_style_pad_all(chatList, 2, 0);
+  lv_obj_set_style_pad_row(chatList, 6, 0);
+  lv_obj_set_scroll_dir(chatList, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(chatList, LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_flex_flow(chatList, LV_FLEX_FLOW_COLUMN);
 
   lv_obj_t* gear = lv_btn_create(mainScreen);
   lv_obj_set_size(gear, 44, 44);
@@ -540,28 +574,20 @@ static void BuildMainScreen() {
 // talking, the on-screen button shrinks to a status dot and the reply text takes
 // over the freed space.
 static void ApplyMainLayout() {
-  if (!talkBtn || !replyBox) return;
+  if (!talkBtn || !chatList) return;
 
   if (GetUseBootButton()) {
-    lv_obj_set_size(talkBtn, 92, 92);
-    lv_obj_align(talkBtn, LV_ALIGN_TOP_MID, 0, 62);
+    lv_obj_set_size(talkBtn, 84, 84);
+    lv_obj_align(talkBtn, LV_ALIGN_TOP_MID, 0, 58);
 
-    lv_obj_set_width(heardLabel, 250);
-    lv_obj_align(heardLabel, LV_ALIGN_TOP_MID, 0, 160);
-
-    lv_obj_set_size(replyBox, 250, 118);
-    lv_obj_align(replyBox, LV_ALIGN_TOP_MID, 0, 190);
-    lv_obj_set_width(replyLabel, 236);
+    lv_obj_set_size(chatList, 244, 158);
+    lv_obj_align(chatList, LV_ALIGN_TOP_MID, 0, 150);
   } else {
-    lv_obj_set_size(talkBtn, 170, 170);
-    lv_obj_align(talkBtn, LV_ALIGN_CENTER, 0, -36);
+    lv_obj_set_size(talkBtn, 150, 150);
+    lv_obj_align(talkBtn, LV_ALIGN_CENTER, 0, -52);
 
-    lv_obj_set_width(heardLabel, 240);
-    lv_obj_align(heardLabel, LV_ALIGN_BOTTOM_MID, 0, -104);
-
-    lv_obj_set_size(replyBox, 250, 64);
-    lv_obj_align(replyBox, LV_ALIGN_BOTTOM_MID, 0, -46);
-    lv_obj_set_width(replyLabel, 236);
+    lv_obj_set_size(chatList, 244, 96);
+    lv_obj_align(chatList, LV_ALIGN_BOTTOM_MID, 0, -46);
   }
 }
 
@@ -671,6 +697,51 @@ static void BuildSettingsScreen() {
     GranVoice_Audio_PlayTap();
     Serial.printf("[GranVoice] compact talk button: %s\n", on ? "ON" : "OFF");
   }, LV_EVENT_VALUE_CHANGED, NULL);
+
+  // --- voice. Gemini fixes the voice when the session is set up, so choosing a
+  // new one necessarily starts a fresh session (and clears the conversation).
+  lv_obj_t* voiceLabel = lv_label_create(list);
+  lv_obj_set_style_text_font(voiceLabel, &lv_font_ua_22, 0);
+  lv_obj_set_style_text_color(voiceLabel, lv_color_white(), 0);
+  lv_label_set_text(voiceLabel, "Голос");
+
+  lv_obj_t* voiceDd = lv_dropdown_create(list);
+  lv_obj_set_width(voiceDd, 240);
+  lv_obj_set_style_text_font(voiceDd, &lv_font_ua_22, 0);
+  // A curated subset of Gemini's 30 prebuilt voices - the warm, gentle,
+  // clearly-spoken ones suit an elderly listener better than the whole list.
+  lv_dropdown_set_options(voiceDd,
+      "Sulafat\nVindemiatrix\nAchird\nAchernar\nKore\nGacrux\nSchedar\nAoede");
+  {
+    const char* voices[] = {"Sulafat","Vindemiatrix","Achird","Achernar","Kore","Gacrux","Schedar","Aoede"};
+    String cur = geminiLive.getVoice();
+    for (int i = 0; i < 8; i++) if (cur == voices[i]) { lv_dropdown_set_selected(voiceDd, i); break; }
+  }
+  lv_obj_add_event_cb(voiceDd, [](lv_event_t* e) {
+    static const char* voices[] = {"Sulafat","Vindemiatrix","Achird","Achernar","Kore","Gacrux","Schedar","Aoede"};
+    uint16_t sel = lv_dropdown_get_selected(lv_event_get_target(e));
+    if (sel >= 8) return;
+    GranVoice_Audio_PlayTap();
+    ChatClear();
+    geminiLive.setVoice(voices[sel]); // restarts the session to take effect
+    ShowToast(LV_SYMBOL_OK "  Голос змінено\nНову розмову почато", lv_palette_main(LV_PALETTE_GREEN));
+  }, LV_EVENT_VALUE_CHANGED, NULL);
+
+  // --- start a new conversation
+  lv_obj_t* clearBtn = lv_btn_create(list);
+  lv_obj_set_size(clearBtn, 240, 48);
+  lv_obj_set_style_bg_color(clearBtn, lv_palette_darken(LV_PALETTE_DEEP_ORANGE, 2), 0);
+  lv_obj_add_event_cb(clearBtn, [](lv_event_t*) {
+    GranVoice_Audio_PlayTap();
+    ChatClear();
+    geminiLive.clearSession();
+    ShowToast(LV_SYMBOL_REFRESH "  Нову розмову почато", lv_palette_main(LV_PALETTE_GREEN));
+    ShowMain();
+  }, LV_EVENT_CLICKED, NULL);
+  lv_obj_t* clearLbl = lv_label_create(clearBtn);
+  lv_obj_set_style_text_font(clearLbl, &lv_font_ua_22, 0);
+  lv_label_set_text(clearLbl, LV_SYMBOL_REFRESH " Нова розмова");
+  lv_obj_center(clearLbl);
 
   // --- wifi
   lv_obj_t* wifiBtn = lv_btn_create(list);
@@ -911,11 +982,6 @@ void GranVoice_UI_Init(void) {
   // they're appended rather than replacing each other.
   geminiLive.onHeard([](const char* text) {
     portENTER_CRITICAL(&replyMux);
-    if (pendingReply[0]) {      // previous answer still shown - new question starts
-      pendingReply[0] = '\0';
-      pendingHeard[0] = '\0';
-      replyDirty = true;
-    }
     size_t used = strlen(pendingHeard);
     strncat(pendingHeard, text, sizeof(pendingHeard) - used - 1);
     heardDirty = true;

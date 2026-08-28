@@ -16,6 +16,15 @@ public:
   void loop();           // pump frequently from a dedicated task
   bool isReady() const { return _ready; }
 
+  // Starts a brand-new conversation: drops the resumption handle so the server
+  // can't restore history, then redials.
+  void clearSession();
+
+  // Voice is fixed when the session is set up, so changing it necessarily
+  // starts a fresh session (and therefore clears the conversation).
+  void setVoice(const String& voiceName);
+  String getVoice();
+
   void beginTurn();                                      // re-arms audio sending
   void sendAudioChunk(const uint8_t* pcm16, size_t len); // 16kHz, 16-bit, mono
   void sendAudioStreamEnd();
@@ -62,6 +71,7 @@ private:
 
   String _fragBuf; // accumulates fragmented TEXT frames, if any arrive
   String _sessionHandle; // resumption token from the last sessionResumptionUpdate, if any
+  String _voice;         // empty until loaded from NVS
 
   AudioCallback _onAudio;
   SimpleCallback _onTurnComplete;

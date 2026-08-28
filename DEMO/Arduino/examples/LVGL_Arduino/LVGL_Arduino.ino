@@ -37,9 +37,9 @@ void Driver_Loop(void *parameter)
     BAT_Get_Volts();
 
     // WiFi watchdog: if the router reboots or the device is out of range for a
-    // while, silently retry known credentials every 30s so it heals itself
+    // while, silently retry known credentials every 10s so it heals itself
     // without anyone having to touch the screen.
-    if (WiFi.status() != WL_CONNECTED && millis() - lastWifiRetry > 30000) {
+    if (WiFi.status() != WL_CONNECTED && millis() - lastWifiRetry > 10000) {
       lastWifiRetry = millis();
       Serial.println("[WiFiRetry] disconnected - retrying known networks");
       if (wifiManager.retryKnownNetworks()) {
