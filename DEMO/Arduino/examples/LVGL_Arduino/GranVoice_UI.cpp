@@ -59,8 +59,21 @@ static lv_obj_t* replyBubble = nullptr; // live bubble for the current answer
 // Adds a bubble to the conversation and scrolls to it. Returns the label so a
 // streaming turn can keep updating the same bubble instead of adding one per
 // fragment.
+// Keeping every turn forever exhausted LVGL's heap and corrupted the display.
+// Older turns are dropped; the recent ones are what anyone scrolls back to.
+#define CHAT_MAX_BUBBLES 10
+
 static lv_obj_t* ChatAddBubble(bool fromUser, const char* text) {
   if (!chatList) return nullptr;
+
+  while ((int)lv_obj_get_child_cnt(chatList) >= CHAT_MAX_BUBBLES) {
+    lv_obj_t* oldest = lv_obj_get_child(chatList, 0);
+    if (!oldest) break;
+    // Never free a bubble a live turn is still writing into.
+    if (oldest == lv_obj_get_parent(heardLabel ? heardLabel : nullptr) ||
+        oldest == lv_obj_get_parent(replyBubble ? replyBubble : nullptr)) break;
+    lv_obj_del(oldest);
+  }
   lv_obj_t* wrap = lv_obj_create(chatList);
   lv_obj_set_width(wrap, 280);
   lv_obj_set_height(wrap, LV_SIZE_CONTENT);

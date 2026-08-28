@@ -49,7 +49,11 @@
 #define LV_MEM_CUSTOM 0
 #if LV_MEM_CUSTOM == 0
     /*Size of the memory available for `lv_mem_alloc()` in bytes (>= 2kB)*/
-    #define LV_MEM_SIZE (48U * 1024U)          /*[bytes]*/
+    /* Raised from 48K: the scrolling chat keeps several bubbles alive, each a
+       container plus a wrapped label with its own text buffer. Exhausting the
+       pool makes allocations fail and the display renders corrupted. The chat
+       is also capped (see ChatAddBubble) so growth stays bounded. */
+    #define LV_MEM_SIZE (80U * 1024U)          /*[bytes]*/
 
     /*Set an address for the memory pool instead of allocating it as a normal array. Can be in external SRAM too.*/
     #define LV_MEM_ADR 0     /*0: unused*/

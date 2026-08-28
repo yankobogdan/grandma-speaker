@@ -23,11 +23,13 @@ static volatile bool capturing = false;
 // UI tap click). RX is deliberately NOT covered - see PlaybackTask.
 static SemaphoreHandle_t i2sTxMutex = nullptr;
 
-// A single decoded audio-delta chunk can now be up to ~50KB (see GeminiLive.cpp's
-// PCM_BUF_CAP, sized for the raised WEBSOCKETS_MAX_DATA_SIZE) - sized for several
-// chunks of headroom. PSRAM-backed (see GranVoice_Audio_Init), so this is cheap:
-// out of 8MB PSRAM, not the scarce ~220KB of internal RAM.
-#define PLAYBACK_STREAM_BYTES (192 * 1024)
+// Gemini streams a reply considerably faster than real time, so this has to
+// hold an entire answer, not just smooth out jitter. At 192KB (~4s of 24kHz
+// audio) the buffer filled during any longer reply and xStreamBufferSend
+// silently discarded whatever didn't fit - dropouts heard as chunks of speech
+// separated by silence. 3MB is ~65s of audio and still a small slice of the
+// 8MB PSRAM.
+#define PLAYBACK_STREAM_BYTES (3 * 1024 * 1024)
 
 // Playback must start only once enough audio is buffered to ride out network
 // jitter. Gemini's deltas arrive unevenly, and starting on the first byte left
@@ -239,8 +241,13 @@ void GranVoice_Audio_StopCapture() {
 
 void GranVoice_Audio_QueuePlayback(const uint8_t* pcm24k, size_t len) {
   if (!GranVoice_Audio_GetSpeechEnabled()) return; // text-only reply mode
-  if (playbackStream) {
-    xStreamBufferSend(playbackStream, pcm24k, len, pdMS_TO_TICKS(100));
+  if (!playbackStream) return;
+  size_t sent = xStreamBufferSend(playbackStream, pcm24k, len, pdMS_TO_TICKS(100));
+  if (sent < len) {
+    // Loud, because it means the listener lost part of the answer.
+    Serial.printf("[Playback] BUFFER FULL - dropped %u of %u bytes (queued %u)\n",
+                  (unsigned)(len - sent), (unsigned)len,
+                  (unsigned)(PLAYBACK_STREAM_BYTES - xStreamBufferSpacesAvailable(playbackStream)));
   }
 }
 
