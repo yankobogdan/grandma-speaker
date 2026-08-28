@@ -115,6 +115,10 @@ void setup()
   }
 
   if (wifiConnected) {
+    // Pacific time, because Google's free-tier quotas roll over at midnight
+    // Pacific and the on-screen usage counter resets with them. The POSIX rule
+    // string lets the C library handle US daylight saving itself.
+    configTzTime("PST8PDT,M3.2.0,M11.1.0", "pool.ntp.org", "time.google.com");
     Serial.println("Connecting to Gemini Live...");
     geminiLive.begin();
     // geminiLive.begin() only starts the connection - the actual TLS handshake

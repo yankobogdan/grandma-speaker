@@ -8,7 +8,17 @@
 #include <Preferences.h>
 
 // ESP32-S3 BOOT button. Usable as a normal input once booted; pressed reads LOW.
+// Held for LOCK_HOLD_MS it toggles the touchscreen lock, so the screen can be
+// wiped or carried without triggering a conversation.
 #define BOOT_BUTTON_PIN 0
+#define LOCK_HOLD_MS 2000
+
+// External push-to-talk button, wired to GND (internal pull-up, pressed = LOW).
+// NOTE: GPIO44 is UART0 RX. Free here because the console runs over USB CDC,
+// but don't attach a serial adapter to the UART header while using it.
+#define TALK_BUTTON_PIN 44
+
+static bool screenLocked = false;
 
 extern WiFiManager wifiManager;
 
@@ -42,10 +52,88 @@ static lv_obj_t* replyBox = nullptr;   // scrollable container for long replies
 static lv_obj_t* replyLabel = nullptr;
 static lv_obj_t* wifiLabel = nullptr;
 static lv_obj_t* batteryLabel = nullptr;
+static lv_obj_t* usageLabel = nullptr;
 
-// Talk trigger: on-screen button, or the physical BOOT button. With the physical
-// button the on-screen one shrinks to a status dot, freeing the screen for text.
-static int useBootButton = -1; // -1 = not yet loaded from NVS
+// ---- streamed-voice usage counter -------------------------------------------
+// Counts seconds of microphone audio actually sent to Gemini, persisted in NVS.
+// Google's free-tier quotas roll over at midnight Pacific, so the counter is
+// keyed on the Pacific date and resets when that date changes - matching the
+// reset the user is actually budgeting against.
+static uint32_t usageSecondsToday = 0;
+static char usageDay[12] = {0};      // "YYYY-MM-DD" in Pacific time
+static uint32_t usagePendingMs = 0;  // accumulated but not yet persisted
+
+// Pacific date, or "" until NTP has supplied a plausible time.
+static void PacificDateString(char* out, size_t outLen) {
+  out[0] = '\0';
+  time_t now = time(nullptr);
+  if (now < 1700000000) return; // clock not set yet
+  struct tm tmv;
+  if (!localtime_r(&now, &tmv)) return;
+  strftime(out, outLen, "%Y-%m-%d", &tmv);
+}
+
+static void UsageLoad() {
+  Preferences p;
+  p.begin("granvoice", true);
+  usageSecondsToday = p.getUInt("use_secs", 0);
+  String d = p.getString("use_day", "");
+  p.end();
+  strncpy(usageDay, d.c_str(), sizeof(usageDay) - 1);
+  usageDay[sizeof(usageDay) - 1] = '\0';
+}
+
+static void UsageSave() {
+  Preferences p;
+  p.begin("granvoice", false);
+  p.putUInt("use_secs", usageSecondsToday);
+  p.putString("use_day", usageDay);
+  p.end();
+}
+
+// Rolls the counter over when the Pacific date changes.
+static void UsageRolloverCheck() {
+  char today[12];
+  PacificDateString(today, sizeof(today));
+  if (today[0] == '\0') return;             // no valid clock yet
+  if (usageDay[0] == '\0') {                 // first run with a valid clock
+    strncpy(usageDay, today, sizeof(usageDay) - 1);
+    UsageSave();
+    return;
+  }
+  if (strcmp(today, usageDay) != 0) {
+    Serial.printf("[Usage] new Pacific day %s -> %s, resetting %us\n",
+                  usageDay, today, usageSecondsToday);
+    usageSecondsToday = 0;
+    strncpy(usageDay, today, sizeof(usageDay) - 1);
+    UsageSave();
+  }
+}
+
+// Called with however long the mic was streaming for this turn.
+static void UsageAddMs(uint32_t ms) {
+  usagePendingMs += ms;
+  if (usagePendingMs >= 1000) {
+    usageSecondsToday += usagePendingMs / 1000;
+    usagePendingMs %= 1000;
+    UsageSave(); // once per turn, not per second - easy on the flash
+  }
+}
+
+static void UpdateUsageLabel() {
+  if (!usageLabel) return;
+  static char buf[32];
+  uint32_t mins = usageSecondsToday / 60;
+  uint32_t secs = usageSecondsToday % 60;
+  if (mins > 0) snprintf(buf, sizeof(buf), LV_SYMBOL_UPLOAD " %um", (unsigned)mins);
+  else          snprintf(buf, sizeof(buf), LV_SYMBOL_UPLOAD " %us", (unsigned)secs);
+  lv_label_set_text(usageLabel, buf);
+}
+
+// Compact layout: shrinks the on-screen talk button to a status dot and gives
+// the freed space to the reply text. Useful when the GPIO44 button is doing the
+// talking, so the big touch target isn't needed.
+static int useBootButton = -1; // -1 = not yet loaded from NVS (NVS key kept for compatibility)
 
 static bool GetUseBootButton() {
   if (useBootButton < 0) {
@@ -164,8 +252,42 @@ static void UpdateWifiStatus() {
   }
 }
 
+// Brief centred banner, used for lock state changes.
+static void ShowToast(const char* text, lv_color_t colour) {
+  static lv_obj_t* toast = nullptr;
+  if (toast) { lv_obj_del(toast); toast = nullptr; }
+  toast = lv_label_create(lv_layer_top());
+  lv_obj_set_style_bg_color(toast, colour, 0);
+  lv_obj_set_style_bg_opa(toast, LV_OPA_COVER, 0);
+  lv_obj_set_style_text_color(toast, lv_color_white(), 0);
+  lv_obj_set_style_text_font(toast, &lv_font_ua_22, 0);
+  lv_obj_set_style_pad_all(toast, 14, 0);
+  lv_obj_set_style_radius(toast, 10, 0);
+  lv_label_set_text(toast, text);
+  lv_obj_center(toast);
+  // Self-deleting so callers don't have to track it.
+  lv_timer_t* t = lv_timer_create([](lv_timer_t* tm) {
+    lv_obj_t* o = (lv_obj_t*)tm->user_data;
+    if (o) lv_obj_del(o);
+    lv_timer_del(tm);
+  }, 1600, toast);
+  lv_timer_set_repeat_count(t, 1);
+}
+
+static void SetScreenLocked(bool locked) {
+  screenLocked = locked;
+  if (locked) {
+    ShowToast(LV_SYMBOL_CLOSE "  Екран заблоковано", lv_palette_darken(LV_PALETTE_BLUE_GREY, 2));
+  } else {
+    ShowToast(LV_SYMBOL_OK "  Екран розблоковано", lv_palette_main(LV_PALETTE_GREEN));
+  }
+  GranVoice_Audio_PlayTap();
+  Serial.printf("[GranVoice] touchscreen %s\n", locked ? "LOCKED" : "UNLOCKED");
+}
+
 static void CancelToIdle(const char* reason) {
   Serial.printf("[GranVoice] -> IDLE (%s)\n", reason);
+  if (state == GVState::LISTENING) UsageAddMs(millis() - listenStartMs);
   GranVoice_Audio_StopCapture();
   geminiLive.sendAudioStreamEnd();
   GranVoice_Audio_FlushPlayback();
@@ -175,6 +297,13 @@ static void CancelToIdle(const char* reason) {
 }
 
 static void OnButtonClicked(lv_event_t* e) {
+  // e == nullptr means a physical button, which stays live while the
+  // touchscreen is locked - locking is about stray touches, not disabling the device.
+  if (screenLocked && e != nullptr) {
+    Serial.println("[GranVoice] touch ignored - screen locked");
+    ShowToast(LV_SYMBOL_CLOSE "  Екран заблоковано\nутримуйте BOOT", lv_palette_darken(LV_PALETTE_BLUE_GREY, 2));
+    return;
+  }
   Serial.println("[GranVoice] button tapped");
   GranVoice_Audio_PlayTap();
   if (state == GVState::IDLE) {
@@ -203,19 +332,39 @@ static void GranVoice_Tick(lv_timer_t*) {
     lastWifiCheck = millis();
     UpdateWifiStatus();
     UpdateBatteryStatus();
+    UsageRolloverCheck();
+    UpdateUsageLabel();
   }
 
-  // Physical BOOT button, polled with a simple debounce. Only acts as a talk
-  // trigger when the user has selected that mode in settings.
-  if (GetUseBootButton()) {
-    static bool wasPressed = false;
-    static unsigned long lastEdge = 0;
-    bool pressed = (digitalRead(BOOT_BUTTON_PIN) == LOW);
-    if (pressed != wasPressed && millis() - lastEdge > 50) {
-      lastEdge = millis();
-      wasPressed = pressed;
-      if (pressed) {
-        Serial.println("[GranVoice] BOOT button pressed");
+  // BOOT button: a long hold toggles the touchscreen lock. A short press is
+  // ignored so it can't be mistaken for a talk trigger.
+  {
+    static bool bootWasDown = false;
+    static unsigned long bootDownAt = 0;
+    static bool lockFiredThisHold = false;
+    bool bootDown = (digitalRead(BOOT_BUTTON_PIN) == LOW);
+
+    if (bootDown && !bootWasDown) {
+      bootDownAt = millis();
+      lockFiredThisHold = false;
+    } else if (bootDown && !lockFiredThisHold && millis() - bootDownAt >= LOCK_HOLD_MS) {
+      lockFiredThisHold = true; // fire once per hold, not repeatedly
+      SetScreenLocked(!screenLocked);
+    }
+    bootWasDown = bootDown;
+  }
+
+  // GPIO44 push-to-talk, mirroring a tap on the on-screen button. Works while
+  // the screen is locked, which is the point of having it.
+  {
+    static bool talkWasDown = false;
+    static unsigned long talkEdgeAt = 0;
+    bool talkDown = (digitalRead(TALK_BUTTON_PIN) == LOW);
+    if (talkDown != talkWasDown && millis() - talkEdgeAt > 50) { // debounce
+      talkEdgeAt = millis();
+      talkWasDown = talkDown;
+      if (talkDown) {
+        Serial.println("[GranVoice] GPIO44 button pressed");
         OnButtonClicked(nullptr);
       }
     }
@@ -298,6 +447,14 @@ static void BuildMainScreen() {
   lv_obj_set_style_text_color(batteryLabel, lv_color_white(), 0);
   lv_obj_align(batteryLabel, LV_ALIGN_LEFT_MID, 6, -6);
   lv_label_set_text(batteryLabel, "");
+
+  // Streamed-voice total for the current Pacific day, mirrored opposite the
+  // battery so both status readouts sit clear of the talk button.
+  usageLabel = lv_label_create(mainScreen);
+  lv_obj_set_style_text_font(usageLabel, &lv_font_ua_22, 0);
+  lv_obj_set_style_text_color(usageLabel, lv_palette_main(LV_PALETTE_BLUE_GREY), 0);
+  lv_obj_align(usageLabel, LV_ALIGN_RIGHT_MID, -6, -6);
+  lv_label_set_text(usageLabel, "");
 
   talkBtn = lv_btn_create(mainScreen);
   lv_obj_set_size(talkBtn, 200, 200);
@@ -459,7 +616,7 @@ static void BuildSettingsScreen() {
 
   // --- talk trigger: touchscreen or physical BOOT button
   lv_obj_t* bootCb = lv_checkbox_create(list);
-  lv_checkbox_set_text(bootCb, "Кнопка BOOT для розмови");
+  lv_checkbox_set_text(bootCb, "Компактна кнопка розмови");
   lv_obj_set_style_text_font(bootCb, &lv_font_ua_22, 0);
   lv_obj_set_style_text_color(bootCb, lv_color_white(), 0);
   if (GetUseBootButton()) lv_obj_add_state(bootCb, LV_STATE_CHECKED);
@@ -468,7 +625,7 @@ static void BuildSettingsScreen() {
     SetUseBootButton(on);
     SetVisual(GVState::IDLE);
     GranVoice_Audio_PlayTap();
-    Serial.printf("[GranVoice] talk trigger: %s\n", on ? "BOOT button" : "touchscreen");
+    Serial.printf("[GranVoice] compact talk button: %s\n", on ? "ON" : "OFF");
   }, LV_EVENT_VALUE_CHANGED, NULL);
 
   // --- wifi
@@ -497,10 +654,15 @@ static void ShowSettings() {
 
 // ----------------------------------------------------------- wifi list screen
 
+// Scanned SSIDs kept verbatim: the button label may have a "saved" tick
+// appended, so it can't be read back as the network name.
+static char scannedSSIDs[20][33];
+
 static void OnNetworkPicked(lv_event_t* e) {
   GranVoice_Audio_PlayTap();
-  lv_obj_t* btn = lv_event_get_target(e);
-  const char* ssid = lv_list_get_btn_text(lv_obj_get_parent(btn), btn);
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  if (idx < 0 || idx >= 20) return;
+  const char* ssid = scannedSSIDs[idx];
   strncpy(pendingSSID, ssid, sizeof(pendingSSID) - 1);
   pendingSSID[sizeof(pendingSSID) - 1] = '\0';
 
@@ -512,7 +674,8 @@ static void OnNetworkPicked(lv_event_t* e) {
 }
 
 static void ShowWifiList() {
-  // Rebuilt on each entry so the scan results are always current.
+  // Rebuilt on each entry so results are current; also reachable from the
+  // Refresh button below, which is what "drag to refresh" was reaching for.
   if (wifiListScreen) {
     lv_obj_del(wifiListScreen);
     wifiListScreen = nullptr;
@@ -527,31 +690,61 @@ static void ShowWifiList() {
   lv_obj_set_style_text_color(status, lv_color_white(), 0);
   lv_label_set_text(status, "Пошук мереж...");
   lv_obj_center(status);
-  lv_refr_now(NULL); // paint the "scanning" message before the blocking scan
+  lv_refr_now(NULL); // paint before the blocking scan
 
+  // Drop any cached results first: a stale scan (common right after a failed
+  // connection attempt) returns a negative code that used to be rendered as
+  // "no networks found" with no way to retry.
+  WiFi.mode(WIFI_STA);
+  WiFi.scanDelete();
   int n = WiFi.scanNetworks();
+  if (n < 0) {
+    Serial.printf("[WiFi] scan failed (%d), retrying\n", n);
+    WiFi.scanDelete();
+    delay(400);
+    n = WiFi.scanNetworks();
+  }
+  Serial.printf("[WiFi] scan returned %d\n", n);
   lv_obj_del(status);
 
   lv_obj_t* list = lv_list_create(wifiListScreen);
-  lv_obj_set_size(list, 300, 250);
-  lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 40);
+  lv_obj_set_size(list, 300, 210);
+  lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 34);
   lv_obj_set_style_bg_color(list, lv_palette_darken(LV_PALETTE_GREY, 4), 0);
 
-  for (int i = 0; i < n && i < 20; i++) {
+  int shown = 0;
+  for (int i = 0; i < n && shown < 20; i++) {
     String ssid = WiFi.SSID(i);
     if (ssid.length() == 0) continue;
-    lv_obj_t* btn = lv_list_add_btn(list, LV_SYMBOL_WIFI, ssid.c_str());
+    // A tick marks networks already stored, so it's clear which ones the
+    // device can join on its own.
+    bool saved = wifiManager.isSaved(ssid);
+    strncpy(scannedSSIDs[shown], ssid.c_str(), sizeof(scannedSSIDs[0]) - 1);
+    scannedSSIDs[shown][sizeof(scannedSSIDs[0]) - 1] = '\0';
+    String label = saved ? (ssid + "  " + String(LV_SYMBOL_OK)) : ssid;
+    lv_obj_t* btn = lv_list_add_btn(list, LV_SYMBOL_WIFI, label.c_str());
     lv_obj_set_style_text_font(btn, &lv_font_ua_22, 0);
-    lv_obj_add_event_cb(btn, OnNetworkPicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(btn, OnNetworkPicked, LV_EVENT_CLICKED, (void*)(intptr_t)shown);
+    shown++;
   }
-  if (n <= 0) {
-    lv_obj_t* none = lv_list_add_text(list, "Мереж не знайдено");
+  if (shown == 0) {
+    lv_obj_t* none = lv_list_add_text(list,
+      n < 0 ? "Помилка пошуку. Оновіть." : "Мереж не знайдено");
     lv_obj_set_style_text_font(none, &lv_font_ua_22, 0);
   }
 
+  lv_obj_t* refreshBtn = lv_btn_create(wifiListScreen);
+  lv_obj_set_size(refreshBtn, 140, 42);
+  lv_obj_align(refreshBtn, LV_ALIGN_BOTTOM_LEFT, 34, -18);
+  lv_obj_add_event_cb(refreshBtn, [](lv_event_t*) { GranVoice_Audio_PlayTap(); ShowWifiList(); }, LV_EVENT_CLICKED, NULL);
+  lv_obj_t* refreshLbl = lv_label_create(refreshBtn);
+  lv_obj_set_style_text_font(refreshLbl, &lv_font_ua_22, 0);
+  lv_label_set_text(refreshLbl, LV_SYMBOL_REFRESH " Оновити");
+  lv_obj_center(refreshLbl);
+
   lv_obj_t* backBtn = lv_btn_create(wifiListScreen);
-  lv_obj_set_size(backBtn, 150, 44);
-  lv_obj_align(backBtn, LV_ALIGN_BOTTOM_MID, 0, -22);
+  lv_obj_set_size(backBtn, 120, 42);
+  lv_obj_align(backBtn, LV_ALIGN_BOTTOM_RIGHT, -34, -18);
   lv_obj_set_style_bg_color(backBtn, lv_palette_darken(LV_PALETTE_GREY, 2), 0);
   lv_obj_add_event_cb(backBtn, [](lv_event_t*) { GranVoice_Audio_PlayTap(); ShowSettings(); }, LV_EVENT_CLICKED, NULL);
   lv_obj_t* backLbl = lv_label_create(backBtn);
@@ -641,6 +834,8 @@ static void BuildPasswordScreen() {
 
 void GranVoice_UI_Init(void) {
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(TALK_BUTTON_PIN, INPUT_PULLUP);
+  UsageLoad();
   BuildMainScreen();
   BuildSettingsScreen();
   BuildPasswordScreen();
@@ -648,6 +843,7 @@ void GranVoice_UI_Init(void) {
 
   geminiLive.onAudio([](const uint8_t* pcm, size_t len) {
     if (state == GVState::LISTENING) {
+      UsageAddMs(millis() - listenStartMs); // mic stops here, so bank the time
       GranVoice_Audio_StopCapture();
       state = GVState::SPEAKING;
       audioArrivedFlag = true; // GranVoice_Tick (LVGL task) does the actual SetVisual()

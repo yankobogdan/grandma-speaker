@@ -1,363 +1,237 @@
 #include "WiFi_Manager.h"
 #include "GranVoice_Config.h"
-#include "LVGL_Example.h"
 #include <nvs_flash.h>
+
+// Networks live in NVS as net0_ssid/net0_pass .. netN_ssid/netN_pass plus a
+// count, so the device can follow the user between locations without being
+// reflashed or reconfigured.
+static const char* NVS_NS = "wifi";
 
 WiFiManager::WiFiManager() {
     isConnected = false;
     connectedSSID = "";
-    passwordCount = 0;
-    
+
     Serial.println("\n=== WiFi Manager Initializing ===");
-    
-    // Initialize NVS (Non-Volatile Storage)
+
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         Serial.println("NVS partition was truncated - erasing and reinitializing");
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
-    
     if (err != ESP_OK) {
-        Serial.printf("⚠️ NVS initialization failed: %s\n", esp_err_to_name(err));
-    } else {
-        Serial.println("✓ NVS initialized successfully");
+        Serial.printf("NVS init failed: %s\n", esp_err_to_name(err));
     }
-    
-    // Load passwords from flash (Preferences/NVS)
-    loadPasswordsFromFlash();
-    
-    // If no passwords stored, add defaults
-    if (passwordCount == 0) {
-        Serial.println("No passwords in flash - adding defaults");
-        addPassword(GRANVOICE_DEFAULT_WIFI_PASS);
-        savePasswordsToFlash();
-        Serial.println("Default passwords saved to flash");
-        
-        // Verify the save worked
-        Serial.println("\n=== Verifying Flash Write ===");
-        loadPasswordsFromFlash();
-        if (passwordCount > 0) {
-            Serial.println("✓ Verification successful - passwords are in flash!");
-        } else {
-            Serial.println("⚠️ Verification failed - passwords NOT saved to flash!");
-        }
+
+    // Seed any configured default that isn't stored yet. Idempotent, so adding
+    // a network to the config later still takes effect on an already-provisioned
+    // device instead of only mattering on a virgin NVS.
+    if (strlen(GRANVOICE_DEFAULT_WIFI_SSID) > 0 && !isSaved(GRANVOICE_DEFAULT_WIFI_SSID)) {
+        saveNetwork(GRANVOICE_DEFAULT_WIFI_SSID, GRANVOICE_DEFAULT_WIFI_PASS);
     }
-    
-    Serial.println("=== WiFi Manager Ready ===\n");
+    if (strlen(GRANVOICE_DEFAULT_WIFI2_SSID) > 0 && !isSaved(GRANVOICE_DEFAULT_WIFI2_SSID)) {
+        saveNetwork(GRANVOICE_DEFAULT_WIFI2_SSID, GRANVOICE_DEFAULT_WIFI2_PASS);
+    }
+
+    Serial.printf("=== WiFi Manager Ready (%d saved network(s)) ===\n\n", getSavedCount());
 }
 
-void WiFiManager::loadPasswordsFromFlash() {
-    if (!preferences.begin("wifi", true)) {  // Read-only mode
-        Serial.println("⚠️ Failed to open Preferences in read mode");
-        passwordCount = 0;
-        return;
-    }
-    
-    passwordCount = preferences.getInt("pass_count", 0);
-    
-    Serial.printf("Loading %d passwords from flash storage...\n", passwordCount);
-    
-    for (int i = 0; i < passwordCount && i < MAX_PASSWORDS; i++) {
-        String key = "pass_" + String(i);
-        passwords[i] = preferences.getString(key.c_str(), "");
-        Serial.printf("  Password %d: [%s] (length: %d)\n", i+1, passwords[i].c_str(), passwords[i].length());
-    }
-    
+int WiFiManager::getSavedCount() {
+    preferences.begin(NVS_NS, true);
+    int n = preferences.getInt("net_count", 0);
     preferences.end();
-    Serial.println("Passwords loaded from flash");
+    if (n < 0) n = 0;
+    if (n > MAX_SAVED_NETWORKS) n = MAX_SAVED_NETWORKS;
+    return n;
 }
 
-void WiFiManager::savePasswordsToFlash() {
-    if (!preferences.begin("wifi", false)) {  // Read-write mode
-        Serial.println("⚠️ Failed to open Preferences in write mode!");
-        Serial.println("   Flash storage may not be initialized properly");
-        return;
-    }
-    
-    Serial.printf("Saving %d passwords to flash storage...\n", passwordCount);
-    
-    size_t written = preferences.putInt("pass_count", passwordCount);
-    Serial.printf("  putInt returned: %d bytes\n", written);
-    
-    for (int i = 0; i < passwordCount; i++) {
-        String key = "pass_" + String(i);
-        size_t size = preferences.putString(key.c_str(), passwords[i]);
-        Serial.printf("  Saved: %s = [%s] (%d bytes)\n", key.c_str(), passwords[i].c_str(), size);
-    }
-    
-    preferences.end();
-    Serial.println("✓ Passwords saved to flash successfully");
-}
-
-void WiFiManager::addPassword(const String& password) {
-    if (passwordCount < MAX_PASSWORDS) {
-        passwords[passwordCount] = password;
-        passwordCount++;
-        Serial.printf("Added password: [%s] (total: %d)\n", password.c_str(), passwordCount);
-    } else {
-        Serial.println("Cannot add password - maximum reached");
-    }
-}
-
-void WiFiManager::clearPasswords() {
-    preferences.begin("wifi", false);
-    preferences.clear();
-    preferences.end();
-    
-    passwordCount = 0;
-    Serial.println("All passwords cleared from flash");
-}
-
-int WiFiManager::getPasswordCount() {
-    return passwordCount;
-}
-
-void WiFiManager::printStoredData() {
-    Serial.println("\n╔════════════════════════════════════════╗");
-    Serial.println("║   WiFi Flash Storage Contents         ║");
-    Serial.println("╚════════════════════════════════════════╝");
-    
-    if (!preferences.begin("wifi", true)) {  // Read-only
-        Serial.println("⚠️ ERROR: Cannot open Preferences!");
-        Serial.println("   NVS may not be initialized");
-        return;
-    }
-    
-    int count = preferences.getInt("pass_count", 0);
-    Serial.printf("Password Count: %d\n\n", count);
-    
-    if (count == 0) {
-        Serial.println("❌ No passwords stored in flash");
-        Serial.println("   (This is normal on first boot before passwords are saved)");
-    } else {
-        Serial.println("Stored Passwords:");
-        for (int i = 0; i < count; i++) {
-            String key = "pass_" + String(i);
-            String pass = preferences.getString(key.c_str(), "");
-            Serial.printf("  %d. [%s] (length: %d chars)\n", i+1, pass.c_str(), pass.length());
-        }
-    }
-    
-    preferences.end();
-    
-    Serial.println("\n╔════════════════════════════════════════╗");
-    Serial.println("║   Current Runtime Status              ║");
-    Serial.println("╚════════════════════════════════════════╝");
-    Serial.printf("Active Passwords in Memory: %d\n", passwordCount);
-    Serial.printf("WiFi Connected: %s\n", isConnected ? "YES" : "NO");
-    if (isConnected) {
-        Serial.printf("Connected SSID: %s\n", connectedSSID.c_str());
-        Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
-        Serial.printf("Signal Strength: %d dBm\n", WiFi.RSSI());
-    }
-    Serial.println("════════════════════════════════════════\n");
-}
-
-String WiFiManager::getSavedSSID() {
-    preferences.begin("wifi", true);
-    String s = preferences.getString("user_ssid", "");
+String WiFiManager::getSavedSSID(int index) {
+    if (index < 0 || index >= MAX_SAVED_NETWORKS) return "";
+    preferences.begin(NVS_NS, true);
+    String s = preferences.getString(("net" + String(index) + "_ssid").c_str(), "");
     preferences.end();
     return s;
 }
 
-String WiFiManager::getSavedPassword() {
-    preferences.begin("wifi", true);
-    String p = preferences.getString("user_pass", "");
+String WiFiManager::getSavedPasswordFor(const String& ssid) {
+    int n = getSavedCount();
+    preferences.begin(NVS_NS, true);
+    String pass = "";
+    for (int i = 0; i < n; i++) {
+        if (preferences.getString(("net" + String(i) + "_ssid").c_str(), "") == ssid) {
+            pass = preferences.getString(("net" + String(i) + "_pass").c_str(), "");
+            break;
+        }
+    }
     preferences.end();
-    return p;
+    return pass;
+}
+
+bool WiFiManager::isSaved(const String& ssid) {
+    int n = getSavedCount();
+    for (int i = 0; i < n; i++) {
+        if (getSavedSSID(i) == ssid) return true;
+    }
+    return false;
+}
+
+void WiFiManager::saveNetwork(const String& ssid, const String& password) {
+    int n = getSavedCount();
+
+    // Updating an existing entry keeps the list free of duplicates when a
+    // password changes.
+    int slot = -1;
+    for (int i = 0; i < n; i++) {
+        if (getSavedSSID(i) == ssid) { slot = i; break; }
+    }
+    if (slot < 0) {
+        if (n < MAX_SAVED_NETWORKS) {
+            slot = n;
+            n++;
+        } else {
+            slot = 0; // full - overwrite the oldest
+        }
+    }
+
+    preferences.begin(NVS_NS, false);
+    preferences.putString(("net" + String(slot) + "_ssid").c_str(), ssid);
+    preferences.putString(("net" + String(slot) + "_pass").c_str(), password);
+    preferences.putInt("net_count", n);
+    preferences.end();
+    Serial.printf("Saved network '%s' in slot %d (%d total)\n", ssid.c_str(), slot, n);
+}
+
+void WiFiManager::forgetNetwork(const String& ssid) {
+    int n = getSavedCount();
+    String ssids[MAX_SAVED_NETWORKS], passes[MAX_SAVED_NETWORKS];
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        String s = getSavedSSID(i);
+        if (s.length() == 0 || s == ssid) continue;
+        ssids[kept] = s;
+        passes[kept] = getSavedPasswordFor(s);
+        kept++;
+    }
+    preferences.begin(NVS_NS, false);
+    for (int i = 0; i < kept; i++) {
+        preferences.putString(("net" + String(i) + "_ssid").c_str(), ssids[i]);
+        preferences.putString(("net" + String(i) + "_pass").c_str(), passes[i]);
+    }
+    preferences.putInt("net_count", kept);
+    preferences.end();
+    Serial.printf("Forgot '%s' (%d remaining)\n", ssid.c_str(), kept);
+}
+
+bool WiFiManager::connectToNetwork(const char* ssid, const char* password) {
+    // Disconnect first. Without this, switching networks while already
+    // associated left WiFi.status() reporting WL_CONNECTED for the OLD network,
+    // so a "successful" switch silently kept the previous connection.
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("    (disconnecting from %s first)\n", WiFi.SSID().c_str());
+        WiFi.disconnect(false, true);
+        unsigned long t0 = millis();
+        while (WiFi.status() == WL_CONNECTED && millis() - t0 < 5000) delay(100);
+    }
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+
+    Serial.printf("    Connecting to '%s'", ssid);
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        // Guard against associating with something other than what we asked for.
+        if (WiFi.SSID() != String(ssid)) {
+            Serial.printf("    Connected to '%s' but expected '%s' - treating as failure\n",
+                          WiFi.SSID().c_str(), ssid);
+            isConnected = false;
+            return false;
+        }
+        isConnected = true;
+        connectedSSID = ssid;
+        Serial.printf("    CONNECTED to %s, IP %s, %d dBm\n",
+                      ssid, WiFi.localIP().toString().c_str(), WiFi.RSSI());
+        return true;
+    }
+
+    Serial.printf("    FAILED (status %d)\n", (int)WiFi.status());
+    isConnected = false;
+    connectedSSID = "";
+    WiFi.disconnect(false, true);
+    delay(300);
+    return false;
 }
 
 bool WiFiManager::connectAndSave(const String& ssid, const String& password) {
-    Serial.printf("Trying user-provisioned network: %s\n", ssid.c_str());
     if (!connectToNetwork(ssid.c_str(), password.c_str())) {
-        Serial.println("User-provisioned network failed - not saving");
+        Serial.println("Not saving - connection failed");
         return false;
     }
-    preferences.begin("wifi", false);
-    preferences.putString("user_ssid", ssid);
-    preferences.putString("user_pass", password);
-    preferences.end();
-    Serial.printf("Saved user network '%s' to flash\n", ssid.c_str());
+    saveNetwork(ssid, password);
     return true;
-}
-
-bool WiFiManager::retryKnownNetworks() {
-    // Saved (user-provisioned) network first, then the built-in known one.
-    String userSSID = getSavedSSID();
-    if (userSSID.length() > 0) {
-        if (connectToNetwork(userSSID.c_str(), getSavedPassword().c_str())) {
-            Serial.printf("[WiFiRetry] reconnected to saved network: %s\n", userSSID.c_str());
-            return true;
-        }
-    }
-    const char* knownNetworks[] = {GRANVOICE_DEFAULT_WIFI_SSID};
-    const int knownCount = sizeof(knownNetworks) / sizeof(knownNetworks[0]);
-    for (int k = 0; k < knownCount; k++) {
-        for (int pw = 0; pw < passwordCount; pw++) {
-            if (connectToNetwork(knownNetworks[k], passwords[pw].c_str())) {
-                Serial.printf("[WiFiRetry] reconnected to: %s\n", knownNetworks[k]);
-                return true;
-            }
-        }
-    }
-    return false;
 }
 
 bool WiFiManager::connectToBestNetwork() {
     Serial.println("\n=== WiFi Manager Starting ===");
-
-    // Force reset WiFi to clear any previous state
-    Serial.println("Resetting WiFi...");
-    WiFi.disconnect(true);  // Disconnect and erase credentials
-    WiFi.mode(WIFI_OFF);
-    delay(500);
     WiFi.mode(WIFI_STA);
-    delay(500);
 
-    // A network the user entered on the touchscreen wins over the built-in list.
-    String userSSID = getSavedSSID();
-    if (userSSID.length() > 0) {
-        String userPass = getSavedPassword();
-        Serial.printf("Trying saved user network: %s\n", userSSID.c_str());
-        LVGL_WiFi_Display("Connecting...");
-        if (connectToNetwork(userSSID.c_str(), userPass.c_str())) {
-            Serial.printf("Connected to saved user network: %s\n", userSSID.c_str());
-            LVGL_WiFi_Display(userSSID.c_str());
-            return true;
-        }
-        Serial.println("Saved user network failed, falling back to scan");
-    }
-
-    // Only networks we have a real reason to try - the vendor demo's original
-    // behaviour (every stored password against every visible AP) took minutes
-    // and broadcast the password at every stranger's router nearby. Anything
-    // else is handled by on-screen provisioning + the periodic retry below.
-    Serial.println("Scanning for known networks...");
-    LVGL_WiFi_Display("Scanning WiFi...");
-
-    int n = WiFi.scanNetworks();
-    if (n <= 0) {
-        Serial.println("ERROR: No networks found");
-        LVGL_WiFi_Display("No WiFi found");
+    int saved = getSavedCount();
+    if (saved == 0) {
+        Serial.println("No saved networks");
         return false;
     }
 
-    Serial.printf("\n=== Found %d networks ===\n", n);
+    // A stale cached scan is a common source of "no networks found", so the
+    // previous results are dropped before scanning.
+    WiFi.scanDelete();
+    Serial.println("Scanning...");
+    int n = WiFi.scanNetworks();
+    if (n < 0) {
+        Serial.printf("Scan failed (%d) - retrying once\n", n);
+        WiFi.scanDelete();
+        delay(500);
+        n = WiFi.scanNetworks();
+    }
+    Serial.printf("Found %d networks\n", n);
+
+    // Try saved networks that are actually in range, strongest first. scanNetworks
+    // already returns results sorted by RSSI.
     for (int i = 0; i < n; i++) {
-        Serial.printf("  %d: %-20s (RSSI: %d dBm, Ch: %d, Enc: %d)\n",
-                      i+1, WiFi.SSID(i).c_str(), WiFi.RSSI(i),
-                      WiFi.channel(i), WiFi.encryptionType(i));
-    }
-
-    const char* knownNetworks[] = {GRANVOICE_DEFAULT_WIFI_SSID};
-    const int knownCount = sizeof(knownNetworks) / sizeof(knownNetworks[0]);
-
-    for (int k = 0; k < knownCount; k++) {
-        bool inRange = false;
-        for (int i = 0; i < n; i++) {
-            if (WiFi.SSID(i).equalsIgnoreCase(knownNetworks[k])) { inRange = true; break; }
-        }
-        if (!inRange) {
-            Serial.printf("Known network '%s' not in range\n", knownNetworks[k]);
-            continue;
-        }
-        for (int pw = 0; pw < passwordCount; pw++) {
-            char displayBuf[64];
-            snprintf(displayBuf, sizeof(displayBuf), "%s...", knownNetworks[k]);
-            LVGL_WiFi_Display(displayBuf);
-            Serial.printf("Trying known network '%s' (password %d/%d)\n", knownNetworks[k], pw+1, passwordCount);
-            if (connectToNetwork(knownNetworks[k], passwords[pw].c_str())) {
-                Serial.println("\n*** SUCCESS! ***");
-                Serial.printf("Connected to: %s\n", knownNetworks[k]);
-                Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
-                Serial.printf("Signal strength: %d dBm\n", WiFi.RSSI());
-                Serial.println("=== WiFi Connected ===\n");
-                LVGL_WiFi_Display(knownNetworks[k]);
-                return true;
-            }
+        String ssid = WiFi.SSID(i);
+        if (ssid.length() == 0 || !isSaved(ssid)) continue;
+        Serial.printf("  saved network in range: %s (%d dBm)\n", ssid.c_str(), WiFi.RSSI(i));
+        if (connectToNetwork(ssid.c_str(), getSavedPasswordFor(ssid).c_str())) {
+            return true;
         }
     }
 
-    Serial.println("\n=== FAILED: Could not connect to any network ===\n");
-    LVGL_WiFi_Display("WiFi failed");
+    Serial.println("=== No saved network could be joined ===");
     return false;
 }
 
-bool WiFiManager::connectToNetwork(const char* ssid, const char* password) {
-    // Add a small delay before attempting connection
-    delay(1000);
-    
+bool WiFiManager::retryKnownNetworks() {
     WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, password);
-    
-    Serial.print("    Connecting");
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) {  // Increased to 30 attempts (15 seconds)
-        delay(500);
-        Serial.print(".");
-        attempts++;
-        
-        // Check if we're stuck
-        if (attempts % 10 == 0) {
-            wl_status_t currentStatus = WiFi.status();
-            Serial.printf(" [Status: %d] ", currentStatus);
+    WiFi.scanDelete();
+    int n = WiFi.scanNetworks();
+    if (n <= 0) return false;
+
+    for (int i = 0; i < n; i++) {
+        String ssid = WiFi.SSID(i);
+        if (ssid.length() == 0 || !isSaved(ssid)) continue;
+        if (connectToNetwork(ssid.c_str(), getSavedPasswordFor(ssid).c_str())) {
+            Serial.printf("[WiFiRetry] reconnected to %s\n", ssid.c_str());
+            return true;
         }
     }
-    Serial.println();
-    
-    wl_status_t status = WiFi.status();
-    
-    if (status == WL_CONNECTED) {
-        isConnected = true;
-        connectedSSID = ssid;
-        Serial.printf("    Status: CONNECTED (took %d attempts)\n", attempts);
-        return true;
-    } else {
-        isConnected = false;
-        connectedSSID = "";
-        
-        // Print detailed failure reason
-        Serial.printf("    Status: FAILED after %d attempts - ", attempts);
-        switch (status) {
-            case WL_NO_SSID_AVAIL:
-                Serial.println("SSID not available");
-                break;
-            case WL_CONNECT_FAILED:
-                Serial.println("Connection failed (likely wrong password)");
-                break;
-            case WL_CONNECTION_LOST:
-                Serial.println("Connection lost");
-                break;
-            case WL_DISCONNECTED:
-                Serial.println("Disconnected (wrong password or incompatible encryption)");
-                break;
-            case WL_IDLE_STATUS:
-                Serial.println("Idle (timeout)");
-                break;
-            default:
-                Serial.printf("Unknown status: %d\n", status);
-                break;
-        }
-        
-        // Force disconnect and wait before next attempt
-        WiFi.disconnect(true);
-        delay(500);
-        return false;
-    }
+    return false;
 }
 
-bool WiFiManager::getConnectionStatus() {
-    return isConnected;
-}
-
-String WiFiManager::getConnectedSSID() {
-    return connectedSSID;
-}
-
-String WiFiManager::getIPAddress() {
-    if (isConnected) {
-        return WiFi.localIP().toString();
-    }
-    return "Not connected";
-}
+bool WiFiManager::getConnectionStatus() { return isConnected; }
+String WiFiManager::getConnectedSSID()  { return connectedSSID; }
+String WiFiManager::getIPAddress()      { return isConnected ? WiFi.localIP().toString() : String("Not connected"); }

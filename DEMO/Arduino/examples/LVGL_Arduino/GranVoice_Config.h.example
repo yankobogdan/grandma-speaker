@@ -29,3 +29,9 @@
 // SSID empty to rely purely on on-screen provisioning.
 #define GRANVOICE_DEFAULT_WIFI_SSID "YourNetworkName"
 #define GRANVOICE_DEFAULT_WIFI_PASS "your_wifi_password"
+
+// Optional second network, seeded alongside the first. The device stores up to
+// MAX_SAVED_NETWORKS and joins whichever is in range, so it follows you between
+// locations. Leave the SSID empty to skip. More can be added on the screen.
+#define GRANVOICE_DEFAULT_WIFI2_SSID ""
+#define GRANVOICE_DEFAULT_WIFI2_PASS ""
