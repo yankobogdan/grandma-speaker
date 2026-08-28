@@ -32,7 +32,7 @@ static SemaphoreHandle_t i2sTxMutex = nullptr;
 // Playback must start only once enough audio is buffered to ride out network
 // jitter. Gemini's deltas arrive unevenly, and starting on the first byte left
 // the DMA starved between packets - the "chunk by chunk" stutter.
-#define PREROLL_MS 350
+#define PREROLL_MS 700
 #define PREROLL_BYTES ((GEMINI_AUDIO_RATE * 2 * PREROLL_MS) / 1000)
 
 // 24000 -> 16000 is exactly 3:2, so the step is 1.5 in 16.16 fixed point.
@@ -46,8 +46,11 @@ static volatile bool playbackActive = false; // false until pre-roll is satisfie
 
 static void PlaybackTask(void*) {
   static const size_t IN_BUF_SAMPLES = 4096;
-  static int16_t* inBuf = (int16_t*) heap_caps_malloc((IN_BUF_SAMPLES + 2) * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-  static int32_t* outBuf = (int32_t*) heap_caps_malloc((IN_BUF_SAMPLES + 8) * sizeof(int32_t), MALLOC_CAP_SPIRAM);
+  // Internal RAM, not PSRAM: the resampler touches these per sample and PSRAM
+  // access is markedly slower. ~24KB out of ~220KB free, and it keeps the I2S
+  // DMA source in fast memory too.
+  static int16_t* inBuf = (int16_t*) heap_caps_malloc((IN_BUF_SAMPLES + 2) * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  static int32_t* outBuf = (int32_t*) heap_caps_malloc((IN_BUF_SAMPLES + 8) * sizeof(int32_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   static uint32_t srcPosQ16 = 0;
   static int16_t carry = 0;
   static bool haveCarry = false;
@@ -203,7 +206,7 @@ void GranVoice_Audio_Init() {
 
   // Playback outranks capture: an underfed TX DMA is audible immediately (the
   // reply breaks up into noise), whereas a late mic read just delays a chunk.
-  xTaskCreatePinnedToCore(PlaybackTask, "GVPlayback", 4096, NULL, 6, NULL, 0);
+  xTaskCreatePinnedToCore(PlaybackTask, "GVPlayback", 4096, NULL, 12, NULL, 0);
   xTaskCreatePinnedToCore(CaptureTask, "GVCapture", 4096, NULL, 4, NULL, 0);
 
   GranVoice_Audio_SetVolume(GranVoice_Audio_GetVolume()); // re-apply the saved level

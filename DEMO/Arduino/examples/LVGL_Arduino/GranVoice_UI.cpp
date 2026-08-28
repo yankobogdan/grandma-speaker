@@ -62,7 +62,7 @@ static lv_obj_t* replyBubble = nullptr; // live bubble for the current answer
 static lv_obj_t* ChatAddBubble(bool fromUser, const char* text) {
   if (!chatList) return nullptr;
   lv_obj_t* wrap = lv_obj_create(chatList);
-  lv_obj_set_width(wrap, 224);
+  lv_obj_set_width(wrap, 280);
   lv_obj_set_height(wrap, LV_SIZE_CONTENT);
   lv_obj_set_style_bg_color(wrap,
       fromUser ? lv_palette_darken(LV_PALETTE_BLUE_GREY, 3)
@@ -77,7 +77,7 @@ static lv_obj_t* ChatAddBubble(bool fromUser, const char* text) {
   lv_obj_set_style_text_color(lbl,
       fromUser ? lv_palette_lighten(LV_PALETTE_BLUE_GREY, 4) : lv_color_white(), 0);
   lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-  lv_obj_set_width(lbl, 208);
+  lv_obj_set_width(lbl, 264);
   lv_label_set_text(lbl, text);
 
   lv_obj_scroll_to_view(wrap, LV_ANIM_OFF);
@@ -432,7 +432,14 @@ static void GranVoice_Tick(lv_timer_t*) {
     }
   }
 
-  if (heardDirty) {
+  // Transcript fragments arrive many times a second. Repainting on each one
+  // costs a redraw + SPI transfer that competes with audio playback, so the
+  // text is coalesced and applied at a steady, modest rate instead.
+  static unsigned long lastTextPaint = 0;
+  bool mayPaintText = (millis() - lastTextPaint) >= 250;
+
+  if (heardDirty && mayPaintText) {
+    lastTextPaint = millis();
     portENTER_CRITICAL(&replyMux);
     heardDirty = false;
     static char hsnap[sizeof(pendingHeard)];
@@ -446,7 +453,8 @@ static void GranVoice_Tick(lv_timer_t*) {
     }
   }
 
-  if (replyDirty) {
+  if (replyDirty && mayPaintText) {
+    lastTextPaint = millis();
     portENTER_CRITICAL(&replyMux);
     replyDirty = false;
     static char snapshot[sizeof(pendingReply)];
@@ -515,7 +523,7 @@ static void BuildMainScreen() {
 
   wifiLabel = lv_label_create(mainScreen);
   lv_obj_set_style_text_font(wifiLabel, &lv_font_ua_22, 0);
-  lv_obj_align(wifiLabel, LV_ALIGN_TOP_MID, 0, 30);
+  lv_obj_align(wifiLabel, LV_ALIGN_TOP_MID, 0, 16);
   lv_label_set_text(wifiLabel, "...");
 
   // Left edge at vertical centre - the widest part of the round panel, and
@@ -523,7 +531,7 @@ static void BuildMainScreen() {
   batteryLabel = lv_label_create(mainScreen);
   lv_obj_set_style_text_font(batteryLabel, &lv_font_ua_22, 0);
   lv_obj_set_style_text_color(batteryLabel, lv_color_white(), 0);
-  lv_obj_align(batteryLabel, LV_ALIGN_LEFT_MID, 6, -6);
+  lv_obj_align(batteryLabel, LV_ALIGN_TOP_MID, -62, 44);
   lv_label_set_text(batteryLabel, "");
 
   // Streamed-voice total for the current Pacific day, mirrored opposite the
@@ -531,7 +539,7 @@ static void BuildMainScreen() {
   usageLabel = lv_label_create(mainScreen);
   lv_obj_set_style_text_font(usageLabel, &lv_font_ua_22, 0);
   lv_obj_set_style_text_color(usageLabel, lv_palette_main(LV_PALETTE_BLUE_GREY), 0);
-  lv_obj_align(usageLabel, LV_ALIGN_RIGHT_MID, -6, -6);
+  lv_obj_align(usageLabel, LV_ALIGN_TOP_MID, 62, 44);
   lv_label_set_text(usageLabel, "");
 
   talkBtn = lv_btn_create(mainScreen);
@@ -577,17 +585,17 @@ static void ApplyMainLayout() {
   if (!talkBtn || !chatList) return;
 
   if (GetUseBootButton()) {
-    lv_obj_set_size(talkBtn, 84, 84);
-    lv_obj_align(talkBtn, LV_ALIGN_TOP_MID, 0, 58);
+    lv_obj_set_size(talkBtn, 76, 76);
+    lv_obj_align(talkBtn, LV_ALIGN_TOP_MID, 0, 74);
 
-    lv_obj_set_size(chatList, 244, 158);
-    lv_obj_align(chatList, LV_ALIGN_TOP_MID, 0, 150);
+    lv_obj_set_size(chatList, 300, 152);
+    lv_obj_align(chatList, LV_ALIGN_TOP_MID, 0, 158);
   } else {
-    lv_obj_set_size(talkBtn, 150, 150);
-    lv_obj_align(talkBtn, LV_ALIGN_CENTER, 0, -52);
+    lv_obj_set_size(talkBtn, 148, 148);
+    lv_obj_align(talkBtn, LV_ALIGN_CENTER, 0, -46);
 
-    lv_obj_set_size(chatList, 244, 96);
-    lv_obj_align(chatList, LV_ALIGN_BOTTOM_MID, 0, -46);
+    lv_obj_set_size(chatList, 300, 104);
+    lv_obj_align(chatList, LV_ALIGN_BOTTOM_MID, 0, -44);
   }
 }
 
