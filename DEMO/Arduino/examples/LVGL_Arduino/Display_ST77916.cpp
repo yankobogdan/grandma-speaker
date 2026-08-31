@@ -352,13 +352,12 @@ void ST77916_Init() {
 
 void LCD_addWindow(uint16_t Xstart, uint16_t Ystart, uint16_t Xend, uint16_t Yend,uint16_t* color)
 { 
+  // The panel wants big-endian RGB565 and LVGL renders little-endian
+  // (LV_COLOR_16_SWAP 0), so swap here.
   uint32_t size = (Xend - Xstart +1 ) * (Yend - Ystart + 1);
   for (size_t i = 0; i < size; i++) {
     color[i] = (((color[i] >> 8) & 0xFF) | ((color[i] << 8) & 0xFF00));
   }
-  // for (size_t i = 0; i < size; i++) {
-  //   color[i] = 0xFFFF;
-  // }
   Xend = Xend + 1;      // esp_lcd_panel_draw_bitmap: x_end End index on x-axis (x_end not included)
   Yend = Yend + 1;      // esp_lcd_panel_draw_bitmap: y_end End index on y-axis (y_end not included)
   if (Xend > EXAMPLE_LCD_WIDTH)

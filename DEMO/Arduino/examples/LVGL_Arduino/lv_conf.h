@@ -27,6 +27,10 @@
 #define LV_COLOR_DEPTH 16
 
 /*Swap the 2 bytes of RGB565 color. Useful if the display has an 8-bit interface (e.g. SPI)*/
+// LCD_addWindow does the big-endian swap for the ST77916 itself.
+// NOTE: changing this REQUIRES a clean build (arduino-cli compile --clean) -
+// arduino-cli caches compiled LVGL objects, and a stale one here shows up as
+// wrong colours on the panel.
 #define LV_COLOR_16_SWAP 0
 
 /*Enable features to draw on transparent background.

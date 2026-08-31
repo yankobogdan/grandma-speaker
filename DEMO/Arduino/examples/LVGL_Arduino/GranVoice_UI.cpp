@@ -172,6 +172,28 @@ static void UsageAddMs(uint32_t ms) {
   }
 }
 
+// lv_label_set_text always invalidates the object, even when the string is
+// identical, and with disp_drv.full_refresh a single dirty label repaints the
+// entire 360x360 screen: 259KB pushed through the SPI driver's internal-RAM
+// bounce buffers, 127 malloc/free pairs. Doing that every 5 seconds for a
+// battery percentage and an SSID that almost never change fragmented internal
+// DRAM until mbedtls could no longer allocate its buffers, at which point every
+// Gemini reconnect failed with "SSL - Memory allocation failed (-32512)" and the
+// device was dead until a reboot. So: only touch the widget when it would
+// actually look different.
+static void SetLabelIfChanged(lv_obj_t* label, const char* text) {
+  if (!label) return;
+  const char* cur = lv_label_get_text(label);
+  if (cur && strcmp(cur, text) == 0) return;
+  lv_label_set_text(label, text);
+}
+
+static void SetTextColorIfChanged(lv_obj_t* obj, lv_color_t col) {
+  if (!obj) return;
+  if (lv_obj_get_style_text_color(obj, LV_PART_MAIN).full == col.full) return;
+  lv_obj_set_style_text_color(obj, col, 0);
+}
+
 static void UpdateUsageLabel() {
   if (!usageLabel) return;
   static char buf[32];
@@ -179,7 +201,7 @@ static void UpdateUsageLabel() {
   uint32_t secs = usageSecondsToday % 60;
   if (mins > 0) snprintf(buf, sizeof(buf), LV_SYMBOL_UPLOAD " %um", (unsigned)mins);
   else          snprintf(buf, sizeof(buf), LV_SYMBOL_UPLOAD " %us", (unsigned)secs);
-  lv_label_set_text(usageLabel, buf);
+  SetLabelIfChanged(usageLabel, buf);
 }
 
 // Compact layout: shrinks the on-screen talk button to a status dot and gives
@@ -276,12 +298,12 @@ static void UpdateBatteryStatus() {
 
   static char buf[32];
   snprintf(buf, sizeof(buf), "%s %d%%", icon, pct);
-  lv_label_set_text(batteryLabel, buf);
+  SetLabelIfChanged(batteryLabel, buf);
 
   lv_color_t col = (pct <= 15) ? lv_palette_main(LV_PALETTE_RED)
                  : (pct <= 35) ? lv_palette_main(LV_PALETTE_ORANGE)
                                : lv_color_white();
-  lv_obj_set_style_text_color(batteryLabel, col, 0);
+  SetTextColorIfChanged(batteryLabel, col);
 }
 
 static void UpdateWifiStatus() {
@@ -289,18 +311,18 @@ static void UpdateWifiStatus() {
   // Quota refusal outranks the WiFi indicator: the network is fine, but nothing
   // will work, and "connected" alone would be misleading.
   if (geminiLive.isQuotaExhausted()) {
-    lv_label_set_text(wifiLabel, LV_SYMBOL_WARNING " Ліміт Gemini вичерпано");
-    lv_obj_set_style_text_color(wifiLabel, lv_palette_main(LV_PALETTE_RED), 0);
+    SetLabelIfChanged(wifiLabel, LV_SYMBOL_WARNING " Ліміт Gemini вичерпано");
+    SetTextColorIfChanged(wifiLabel, lv_palette_main(LV_PALETTE_RED));
     return;
   }
   if (WiFi.status() == WL_CONNECTED) {
     static char buf[80];
     snprintf(buf, sizeof(buf), LV_SYMBOL_WIFI " %s", WiFi.SSID().c_str());
-    lv_label_set_text(wifiLabel, buf);
-    lv_obj_set_style_text_color(wifiLabel, lv_palette_main(LV_PALETTE_GREEN), 0);
+    SetLabelIfChanged(wifiLabel, buf);
+    SetTextColorIfChanged(wifiLabel, lv_palette_main(LV_PALETTE_GREEN));
   } else {
-    lv_label_set_text(wifiLabel, LV_SYMBOL_WARNING " Немає WiFi");
-    lv_obj_set_style_text_color(wifiLabel, lv_palette_main(LV_PALETTE_ORANGE), 0);
+    SetLabelIfChanged(wifiLabel, LV_SYMBOL_WARNING " Немає WiFi");
+    SetTextColorIfChanged(wifiLabel, lv_palette_main(LV_PALETTE_ORANGE));
   }
 }
 

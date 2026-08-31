@@ -284,9 +284,17 @@ void GeminiLiveClient::handleEvent(WStype_t type, uint8_t* payload, size_t lengt
     case WStype_DISCONNECTED: {
       // Session age matters: a credential that expires mid-session would show
       // up as drops clustering around a consistent lifetime.
-      Serial.printf("[GeminiLive] WSS disconnected (t=%lu, session_age=%lus, close=%u '%s')\n",
+      // Internal-DRAM figures matter as much as the close code here: the TLS
+      // handshake needs a large contiguous internal block, and once the heap is
+      // fragmented enough that it can't get one, every retry fails with
+      // "SSL - Memory allocation failed (-32512)" and the device never comes
+      // back. largest_internal is the number to watch, not free_internal.
+      Serial.printf("[GeminiLive] WSS disconnected (t=%lu, session_age=%lus, close=%u '%s') "
+                    "largest_internal=%u free_internal=%u\n",
                     millis(), (millis() - _sessionStartMs) / 1000,
-                    ws_last_close_code, ws_last_close_reason);
+                    ws_last_close_code, ws_last_close_reason,
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
       // Was a turn in flight? Then this drop cost the user an answer, and they
       // need to be told - silence alone reads as "the device is broken".
       bool lostMidSession = _ready;
@@ -339,17 +347,29 @@ void GeminiLiveClient::handleServerText(const char* json, size_t len) {
   // which starved the display and jittered playback. The payload shape is
   // fixed, so the base64 is located by scanning and decoded straight out of
   // the receive buffer.
-  const char* dataKey = strstr(json, "\"data\":\"");
+  // Tolerant of whitespace: proto JSON may emit "data": "..." with a space
+  // after the colon, and an exact "data":" match silently missed every audio
+  // frame - which then fell through to the small parser and was dropped.
+  const char* dataKey = strstr(json, "\"data\"");
   if (dataKey) {
-    const char* b64 = dataKey + 8;
-    const char* b64End = strchr(b64, '"');
-    if (b64End && _onAudio) {
+    const char* p = dataKey + 6;          // past "data"
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == ':') p++;
+    while (*p == ' ' || *p == '\t') p++;
+    const char* b64    = (*p == '"') ? p + 1 : nullptr;
+    const char* b64End = b64 ? strchr(b64, '"') : nullptr;
+    if (b64 && b64End && _onAudio) {
       static const size_t PCM_BUF_CAP = 51200;
       static uint8_t* pcmBuf = (uint8_t*) heap_caps_malloc(PCM_BUF_CAP, MALLOC_CAP_SPIRAM);
       size_t outLen = 0;
-      if (pcmBuf && mbedtls_base64_decode(pcmBuf, PCM_BUF_CAP, &outLen,
-                                          (const unsigned char*)b64, b64End - b64) == 0) {
+      int rc = pcmBuf ? mbedtls_base64_decode(pcmBuf, PCM_BUF_CAP, &outLen,
+                                              (const unsigned char*)b64, b64End - b64)
+                      : -1;
+      if (rc == 0) {
         _onAudio(pcmBuf, outLen);
+      } else {
+        Serial.printf("[GeminiLive] audio decode failed rc=%d (b64 %u bytes)\n",
+                      rc, (unsigned)(b64End - b64));
       }
     }
     // Cheap string checks rather than a parse; these flags share the frame.
@@ -365,6 +385,9 @@ void GeminiLiveClient::handleServerText(const char* json, size_t len) {
   // Everything else (setup, transcripts, session handles) is small, so a modest
   // reusable document is enough - and reused, not reallocated per message.
   static DynamicJsonDocument doc(16384);
+  if (len > 12000) {
+    Serial.printf("[GeminiLive] WARNING: %u-byte frame hit the small parser\n", (unsigned)len);
+  }
   doc.clear();
   DeserializationError err = deserializeJson(doc, json, len);
   if (err) {

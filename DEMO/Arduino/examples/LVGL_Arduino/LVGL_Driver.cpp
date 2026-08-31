@@ -5,11 +5,13 @@
     The provided LVGL library file must be installed first
 ******************************************************************************/
 #include "LVGL_Driver.h"
+#include <esp_memory_utils.h>
 
 static lv_disp_draw_buf_t draw_buf;
-// ~25KB each (360*360/10 px * 2 bytes) - allocated from PSRAM at Lvgl_Init() time
-// instead of sitting as static internal-RAM .bss, since internal DRAM is the scarce
-// resource TLS handshakes (mbedtls) compete for.
+// 253KB each (360*360 px * 2 bytes) - full-screen, as full_refresh demands (see
+// LVGL_BUF_LEN). Allocated from PSRAM at Lvgl_Init() time rather than sitting as
+// static internal-RAM .bss, since internal DRAM is the scarce resource TLS
+// handshakes (mbedtls) compete for.
 static lv_color_t* buf1 = nullptr;
 static lv_color_t* buf2 = nullptr;
     
@@ -66,8 +68,30 @@ void example_increase_lvgl_Loop_tick(void *arg)
 void Lvgl_Init(void)
 {
   lv_init();
-  buf1 = (lv_color_t*) heap_caps_malloc(LVGL_BUF_LEN * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
-  buf2 = (lv_color_t*) heap_caps_malloc(LVGL_BUF_LEN * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+  const size_t bufBytes = LVGL_BUF_LEN * sizeof(lv_color_t);
+  // Must be cache-line aligned (32B on this chip; 64 for headroom, and 259200
+  // divides by it exactly). GDMA can read the framebuffer straight out of PSRAM
+  // - CONFIG_SOC_AHB_GDMA_SUPPORT_PSRAM=y - but only if the buffer is aligned.
+  // Plain heap_caps_malloc returns 4-byte-aligned memory, which spi_master
+  // rejects as not DMA-capable; it then tries to allocate an internal-RAM bounce
+  // buffer per transaction and fails once internal DRAM is tight, which is
+  // "setup_dma_priv_buffer: Failed to allocate priv TX buffer" followed by
+  // "panel_io_spi_tx_color: spi transmit (queue) color failed" and a broken image.
+  buf1 = (lv_color_t*) heap_caps_aligned_alloc(64, bufBytes, MALLOC_CAP_SPIRAM);
+  buf2 = (lv_color_t*) heap_caps_aligned_alloc(64, bufBytes, MALLOC_CAP_SPIRAM);
+  // A silently-NULL buffer here hands LVGL a null framebuffer and the display
+  // fails in ways that look like a driver bug, so say so plainly instead.
+  Serial.printf("[LVGL] draw buffers: %u bytes each, buf1=%s buf2=%s, dma-capable=%s/%s (free PSRAM %u)\n",
+                (unsigned)bufBytes, buf1 ? "ok" : "FAILED", buf2 ? "ok" : "FAILED",
+                (buf1 && esp_ptr_dma_ext_capable(buf1)) ? "yes" : "NO",
+                (buf2 && esp_ptr_dma_ext_capable(buf2)) ? "yes" : "NO",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  if (!buf1) {
+    Serial.println("[LVGL] FATAL: no PSRAM for the primary draw buffer");
+    return;
+  }
+  // Second buffer is optional - LVGL runs single-buffered if it's missing, just
+  // with more tearing. Better than not starting.
   lv_disp_draw_buf_init( &draw_buf, buf1, buf2, LVGL_BUF_LEN);
 
   /*Initialize the display*/
@@ -77,10 +101,8 @@ void Lvgl_Init(void)
   disp_drv.hor_res = LCD_WIDTH;
   disp_drv.ver_res = LCD_HEIGHT;
   disp_drv.flush_cb = Lvgl_Display_LCD;
-  // Must stay 1 on this panel: partial refresh leaves heavy visual corruption,
-  // so the ST77916 path here depends on whole-frame writes. The SPI cost that
-  // implies is instead kept down by repainting rarely (see the transcript
-  // throttle in GranVoice_UI) rather than by drawing less per repaint.
+  // Whole-frame writes: partial refresh leaves heavy visual corruption on this
+  // panel.
   disp_drv.full_refresh = 1;
   disp_drv.draw_buf = &draw_buf;
   lv_disp_drv_register( &disp_drv );
